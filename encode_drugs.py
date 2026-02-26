@@ -1538,15 +1538,16 @@ def plot_umap_hdbscan(
     )
     coords = reducer.fit_transform(dist)
 
-    # --- HDBSCAN clustering ---
-    logger.info("  Running HDBSCAN clustering...")
+    # --- HDBSCAN clustering on UMAP 2D coordinates ---
+    # Clustering in UMAP space works much better than on the raw distance
+    # matrix because UMAP compresses the manifold and separates groups.
+    logger.info("  Running HDBSCAN clustering on UMAP embedding...")
     clusterer = hdbscan.HDBSCAN(
-        min_cluster_size=8,
-        min_samples=2,
-        metric="precomputed",
-        cluster_selection_method="leaf",
+        min_cluster_size=6,
+        min_samples=3,
+        cluster_selection_method="eom",
     )
-    labels = clusterer.fit_predict(dist)
+    labels = clusterer.fit_predict(coords)
 
     n_clusters = len(set(labels) - {-1})
     n_noise = (labels == -1).sum()
