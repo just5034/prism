@@ -19,6 +19,7 @@ Usage:
 Prerequisites:
     pip install rdkit numpy pandas matplotlib seaborn scikit-learn
 """
+from __future__ import annotations
 
 import argparse
 import logging
