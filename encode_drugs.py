@@ -1525,7 +1525,7 @@ def plot_umap_hdbscan(
 
     logger.info("  Computing Tanimoto distance matrix for UMAP...")
     sim = compute_tanimoto_matrix(arr_ecfp)
-    dist = 1.0 - sim  # Tanimoto distance
+    dist = (1.0 - sim).astype(np.float64)  # HDBSCAN requires float64
 
     # --- UMAP on precomputed distance ---
     logger.info("  Running UMAP (metric=precomputed)...")
