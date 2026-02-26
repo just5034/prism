@@ -467,6 +467,50 @@ def validate_csv_header(path: Path, expected_substring: str) -> bool:
         return False
 
 
+def validate_csv_header_multiline(
+    path: Path, expected_substring: str, max_lines: int = 10
+) -> bool:
+    """Check that one of the first N lines of a CSV contains an expected substring.
+
+    Useful for files like the Illumina manifest that have metadata rows
+    before the actual column header.
+
+    Parameters
+    ----------
+    path : Path
+        Path to the CSV file.
+    expected_substring : str
+        Substring expected in a header row.
+    max_lines : int
+        Number of lines to search.
+
+    Returns
+    -------
+    bool
+        True if any of the first N lines contains the expected substring.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for i in range(max_lines):
+                line = f.readline()
+                if not line:
+                    break
+                if expected_substring.lower() in line.lower():
+                    logger.debug(
+                        f"  Validated CSV header: {path.name} "
+                        f"(found '{expected_substring}' on line {i + 1})"
+                    )
+                    return True
+        logger.warning(
+            f"  Validation: {path.name} first {max_lines} lines do not "
+            f"contain '{expected_substring}'"
+        )
+        return False
+    except Exception as e:
+        logger.warning(f"  Validation failed for {path.name}: {e}")
+        return False
+
+
 def validate_tsv_header(path: Path) -> bool:
     """Check that a TSV file has a readable header with tabs.
 
@@ -530,7 +574,9 @@ def validate_file(key: str, path: Path) -> bool:
     elif key == "string_info":
         return size_mb >= 1 and validate_gzip_header(path)
     elif key == "illumina_manifest":
-        return size_mb >= 100 and validate_csv_header(path, "IlmnID")
+        # Illumina manifest has metadata rows before the actual header,
+        # so we search the first 10 lines for IlmnID instead of just line 1
+        return size_mb >= 100 and validate_csv_header_multiline(path, "IlmnID", max_lines=10)
 
     return True
 
@@ -649,46 +695,49 @@ def fetch_smiles_for_drug(
     str or None
         Canonical SMILES string, or None if not found.
     """
-    # Strategy 1: By CID
-    if cid:
+    def _try_url(url, label):
         try:
-            url = f"{PUBCHEM_BASE_URL}/compound/cid/{cid}/property/CanonicalSMILES/JSON"
             resp = session.get(url, timeout=PUBCHEM_TIMEOUT)
             if resp.status_code == 200:
                 data = resp.json()
                 smiles = data["PropertyTable"]["Properties"][0]["CanonicalSMILES"]
-                logger.debug(f"    {name}: found by CID {cid}")
+                logger.debug(f"    {name}: found by {label}")
                 return smiles
-        except Exception:
-            pass
+            elif resp.status_code == 404:
+                logger.debug(f"    {name}: not found by {label} (404)")
+            else:
+                logger.debug(
+                    f"    {name}: {label} returned HTTP {resp.status_code}"
+                )
+        except requests.exceptions.ConnectionError as e:
+            logger.debug(f"    {name}: connection error ({label}): {e}")
+        except requests.exceptions.Timeout:
+            logger.debug(f"    {name}: timeout ({label})")
+        except Exception as e:
+            logger.debug(f"    {name}: error ({label}): {type(e).__name__}: {e}")
+        return None
+
+    # Strategy 1: By CID
+    if cid:
+        url = f"{PUBCHEM_BASE_URL}/compound/cid/{cid}/property/CanonicalSMILES/JSON"
+        result = _try_url(url, f"CID {cid}")
+        if result:
+            return result
 
     # Strategy 2: Exact name
-    try:
-        url = f"{PUBCHEM_BASE_URL}/compound/name/{requests.utils.quote(name)}/property/CanonicalSMILES/JSON"
-        resp = session.get(url, timeout=PUBCHEM_TIMEOUT)
-        if resp.status_code == 200:
-            data = resp.json()
-            smiles = data["PropertyTable"]["Properties"][0]["CanonicalSMILES"]
-            logger.debug(f"    {name}: found by exact name")
-            return smiles
-    except Exception:
-        pass
+    url = f"{PUBCHEM_BASE_URL}/compound/name/{requests.utils.quote(name)}/property/CanonicalSMILES/JSON"
+    result = _try_url(url, "exact name")
+    if result:
+        return result
 
     # Strategy 3: Cleaned name
     cleaned = clean_drug_name(name)
     if cleaned != name:
-        try:
-            url = f"{PUBCHEM_BASE_URL}/compound/name/{requests.utils.quote(cleaned)}/property/CanonicalSMILES/JSON"
-            resp = session.get(url, timeout=PUBCHEM_TIMEOUT)
-            if resp.status_code == 200:
-                data = resp.json()
-                smiles = data["PropertyTable"]["Properties"][0]["CanonicalSMILES"]
-                logger.debug(f"    {name}: found by cleaned name '{cleaned}'")
-                return smiles
-        except Exception:
-            pass
+        url = f"{PUBCHEM_BASE_URL}/compound/name/{requests.utils.quote(cleaned)}/property/CanonicalSMILES/JSON"
+        result = _try_url(url, f"cleaned name '{cleaned}'")
+        if result:
+            return result
 
-    logger.debug(f"    {name}: not found in PubChem")
     return None
 
 
@@ -731,6 +780,31 @@ def download_drug_smiles(
         logger.error("  No drugs found in compounds file")
         return False
 
+    # Connectivity check: try a known drug before querying all 500+
+    logger.info("  Testing PubChem API connectivity...")
+    try:
+        test_url = f"{PUBCHEM_BASE_URL}/compound/name/aspirin/property/CanonicalSMILES/JSON"
+        test_resp = requests.get(test_url, timeout=PUBCHEM_TIMEOUT)
+        if test_resp.status_code == 200:
+            test_data = test_resp.json()
+            test_smiles = test_data["PropertyTable"]["Properties"][0]["CanonicalSMILES"]
+            logger.info(f"  PubChem API reachable (aspirin -> {test_smiles})")
+        else:
+            logger.error(
+                f"  PubChem API returned HTTP {test_resp.status_code} for test query. "
+                f"Response: {test_resp.text[:200]}"
+            )
+            logger.error("  Skipping SMILES download. Try --skip-smiles or check network.")
+            return False
+    except requests.exceptions.ConnectionError as e:
+        logger.error(f"  Cannot reach PubChem API (connection error): {e}")
+        logger.error("  Skipping SMILES download. PubChem may be blocked from this network.")
+        return False
+    except Exception as e:
+        logger.error(f"  PubChem API test failed: {type(e).__name__}: {e}")
+        logger.error("  Skipping SMILES download.")
+        return False
+
     # Filter to unresolved drugs (not in cache or explicitly None meaning "tried and failed")
     unresolved = [d for d in drugs if d["name"] not in cache]
     logger.info(
@@ -743,12 +817,30 @@ def download_drug_smiles(
         session.headers.update({"Accept": "application/json"})
 
         try:
+            consecutive_failures = 0
             for i, drug in enumerate(unresolved):
                 name = drug["name"]
                 cid = drug.get("pubchem_cid")
 
                 smiles = fetch_smiles_for_drug(name, cid, session)
                 cache[name] = smiles  # None if not found
+
+                if smiles:
+                    consecutive_failures = 0
+                else:
+                    consecutive_failures += 1
+
+                # Log first 3 individual failures at INFO level for diagnostics
+                if smiles is None and i < 3:
+                    logger.info(f"    [{name}] not found (check log for details)")
+
+                # Abort early if first 20 all fail (likely network issue)
+                if i == 19 and consecutive_failures == 20:
+                    logger.error(
+                        "  First 20 drugs all failed. Likely a network/firewall issue. "
+                        "Aborting SMILES download. Check the log file for DEBUG details."
+                    )
+                    break
 
                 if (i + 1) % 10 == 0:
                     found = sum(1 for v in cache.values() if v is not None)
