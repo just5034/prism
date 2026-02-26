@@ -585,10 +585,11 @@ def validate_file(key: str, path: Path) -> bool:
 # PUBCHEM SMILES
 # =============================================================================
 
-def clean_drug_name(name: str) -> str:
-    """Clean a drug name for PubChem lookup.
+def parse_drug_name_variants(name: str) -> list:
+    """Generate name variants for PubChem lookup.
 
-    Strips salt forms, parenthetical aliases, and normalizes whitespace.
+    Returns a list of (variant, label) tuples to try in order.
+    Handles parenthetical aliases, salt forms, hyphens, and roman numerals.
 
     Parameters
     ----------
@@ -597,22 +598,48 @@ def clean_drug_name(name: str) -> str:
 
     Returns
     -------
-    str
-        Cleaned drug name.
+    list of (str, str)
+        Each tuple is (name_variant, description_label).
     """
-    cleaned = name.strip()
-    # Remove parenthetical aliases like "(compound X)"
     import re
-    cleaned = re.sub(r"\s*\(.*?\)\s*", " ", cleaned).strip()
-    # Remove common salt suffixes
+
+    variants = []
+
+    # Extract parenthetical alias: "AZD6244 (Selumetinib)" -> "Selumetinib"
+    paren_match = re.search(r"\(([^)]+)\)", name)
+    alias = paren_match.group(1).strip() if paren_match else None
+
+    # Base name without parenthetical
+    base = re.sub(r"\s*\(.*?\)\s*", " ", name).strip()
+
+    # Strip salt suffixes from base
+    desalted = base
     for suffix in [" hydrochloride", " HCl", " dihydrochloride", " mesylate",
                    " maleate", " tosylate", " sodium", " potassium",
                    " fumarate", " succinate", " citrate", " tartrate",
                    " acetate", " sulfate", " phosphate", " bromide",
                    " chloride", " nitrate"]:
-        if cleaned.lower().endswith(suffix.lower()):
-            cleaned = cleaned[: -len(suffix)].strip()
-    return cleaned
+        if desalted.lower().endswith(suffix.lower()):
+            desalted = desalted[: -len(suffix)].strip()
+            break
+
+    # Build variant list (order matters -- most specific first)
+    if base != name:
+        variants.append((base, "base name"))
+    if desalted != base:
+        variants.append((desalted, "desalted"))
+    if alias and alias != base:
+        variants.append((alias, "parenthetical alias"))
+    # Try without hyphens: "AZD-6244" -> "AZD6244"
+    no_hyphen = desalted.replace("-", "")
+    if no_hyphen != desalted:
+        variants.append((no_hyphen, "no hyphens"))
+    # Try with spaces instead of hyphens: "SB-505124" -> "SB 505124"
+    space_hyphen = desalted.replace("-", " ")
+    if space_hyphen != desalted and space_hyphen != no_hyphen:
+        variants.append((space_hyphen, "hyphens as spaces"))
+
+    return variants
 
 
 def get_drug_list_from_compounds(compounds_path: Path) -> list:
@@ -732,24 +759,23 @@ def fetch_smiles_for_drug(
     # PubChem property to request (IsomericSMILES returns as "SMILES" key)
     prop = "CanonicalSMILES,IsomericSMILES"
 
-    # Strategy 1: By CID
+    # Strategy 1: By CID (most reliable)
     if cid:
         url = f"{PUBCHEM_BASE_URL}/compound/cid/{cid}/property/{prop}/JSON"
         result = _try_url(url, f"CID {cid}")
         if result:
             return result
 
-    # Strategy 2: Exact name
+    # Strategy 2: Exact name as given
     url = f"{PUBCHEM_BASE_URL}/compound/name/{requests.utils.quote(name)}/property/{prop}/JSON"
     result = _try_url(url, "exact name")
     if result:
         return result
 
-    # Strategy 3: Cleaned name
-    cleaned = clean_drug_name(name)
-    if cleaned != name:
-        url = f"{PUBCHEM_BASE_URL}/compound/name/{requests.utils.quote(cleaned)}/property/{prop}/JSON"
-        result = _try_url(url, f"cleaned name '{cleaned}'")
+    # Strategy 3+: Try name variants (alias, desalted, no hyphens, etc.)
+    for variant, label in parse_drug_name_variants(name):
+        url = f"{PUBCHEM_BASE_URL}/compound/name/{requests.utils.quote(variant)}/property/{prop}/JSON"
+        result = _try_url(url, label)
         if result:
             return result
 
