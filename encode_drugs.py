@@ -1110,6 +1110,10 @@ def plot_similarity_map_pairs(
     sim = compute_tanimoto_matrix(arr_ecfp)
     name_to_pw = dict(zip(df_index["drug_name"], df_index["pathway"]))
 
+    # Filter mol_map to exclude simple salts/ions (< 5 heavy atoms)
+    def _is_real_molecule(info: dict) -> bool:
+        return info["mol"].GetNumHeavyAtoms() >= 5
+
     # Find best same-pathway pair (high sim) and best diff-pathway pair (low sim)
     best_same = (-1, -1, 0.0)
     best_diff = (-1, -1, 1.0)
@@ -1117,11 +1121,13 @@ def plot_similarity_map_pairs(
 
     for i in range(n):
         pw_i = name_to_pw.get(ecfp_names[i], "")
-        if not pw_i or ecfp_names[i] not in mol_map:
+        info_i = mol_map.get(ecfp_names[i])
+        if not pw_i or not info_i or not _is_real_molecule(info_i):
             continue
         for j in range(i + 1, n):
             pw_j = name_to_pw.get(ecfp_names[j], "")
-            if not pw_j or ecfp_names[j] not in mol_map:
+            info_j = mol_map.get(ecfp_names[j])
+            if not pw_j or not info_j or not _is_real_molecule(info_j):
                 continue
             val = float(sim[i, j])
             if pw_i == pw_j and val > best_same[2] and val < 0.99:
@@ -1246,11 +1252,14 @@ def plot_shared_bits(
     name_to_pw = dict(zip(df_index["drug_name"], df_index["pathway"]))
 
     # Find the largest real pathway with >= 2 drugs in mol_map
-    skip_labels = {"", "Other", "other", "Unknown", "unknown", "nan"}
+    skip_words = {"other", "unknown", "nan", "unclassified"}
     pw_counts = {}
     for name in ecfp_names:
         pw = name_to_pw.get(name, "")
-        if pw and pw not in skip_labels and name in mol_map:
+        # Skip empty or generic pathway labels (e.g. "Other, kinases")
+        if not pw or any(w in pw.lower() for w in skip_words):
+            continue
+        if name in mol_map:
             pw_counts.setdefault(pw, []).append(name)
 
     # Pick the pathway with most drugs
@@ -1278,73 +1287,73 @@ def plot_shared_bits(
         logger.warning("  No shared bits found, skipping")
         return
 
-    # Pick up to 8 shared bits, preferring bits shared across more drugs
-    display_bits = shared_bits[:8]
+    # Pick up to 4 shared bits, each shown across 2 different drugs
+    # Prefer bits shared by many drugs, and pick diverse drug pairs
+    display_bits = shared_bits[:4]
 
     n_bits = len(display_bits)
-    n_cols = min(4, n_bits)
-    n_rows = (n_bits + n_cols - 1) // n_cols
 
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4.5 * n_cols, 5 * n_rows))
-    if n_rows == 1 and n_cols == 1:
-        axes = np.array([[axes]])
-    elif n_rows == 1:
-        axes = axes.reshape(1, -1)
-    elif n_cols == 1:
-        axes = axes.reshape(-1, 1)
+    # Layout: n_bits rows x 2 columns (each row = one shared bit shown on 2 drugs)
+    fig, axes = plt.subplots(n_bits, 2, figsize=(10, 5 * n_bits))
+    if n_bits == 1:
+        axes = axes.reshape(1, 2)
 
-    for idx, (bit_id, drugs) in enumerate(display_bits):
-        row = idx // n_cols
-        col = idx % n_cols
-        ax = axes[row, col]
-
-        # Draw the molecule with the bit's atoms highlighted
-        drug_name = drugs[0]
-        info = mol_map[drug_name]
-        mol = info["mol"]
-        bi = info["bitInfo"]
-
-        # Get atoms for this bit: bitInfo[bit_id] = [(center_atom, radius), ...]
-        highlight_atoms = []
-        radius_info = ""
+    def _get_bit_highlight_atoms(mol, bi, bit_id):
+        """Get atom indices for a specific fingerprint bit."""
+        atoms = []
+        radius = 0
         if bit_id in bi:
             for center, rad in bi[bit_id]:
-                highlight_atoms.append(center)
-                # Also get neighbors within radius
+                atoms.append(center)
+                radius = rad
                 env = Chem.FindAtomEnvironmentOfRadiusN(mol, rad, center)
                 for bond_idx in env:
                     bond = mol.GetBondWithIdx(bond_idx)
-                    highlight_atoms.append(bond.GetBeginAtomIdx())
-                    highlight_atoms.append(bond.GetEndAtomIdx())
-                radius_info = f"radius={rad}"
-            highlight_atoms = sorted(set(highlight_atoms))
+                    atoms.append(bond.GetBeginAtomIdx())
+                    atoms.append(bond.GetEndAtomIdx())
+        return sorted(set(atoms)), radius
 
-        try:
-            img_arr = _mol_to_np_image(mol, size=400,
-                                       highlight_atoms=highlight_atoms)
-            ax.imshow(img_arr)
-            ax.set_title(
-                f"Bit {bit_id} ({radius_info})\n"
-                f"Shared by {len(drugs)}/{len(pw_drugs)} drugs\n"
-                f"{drug_name[:25]}",
-                fontsize=8, fontweight="bold",
-            )
-        except Exception as e:
-            logger.warning(f"  MolToImage failed for bit {bit_id}: {e}")
-            ax.text(0.5, 0.5, f"Bit {bit_id}\n(render failed)",
-                    ha="center", va="center", transform=ax.transAxes)
+    for row_idx, (bit_id, drugs) in enumerate(display_bits):
+        # Pick two DIFFERENT drugs that share this bit
+        drug_a = drugs[0]
+        drug_b = drugs[1] if len(drugs) > 1 else drugs[0]
 
-        ax.axis("off")
+        for col_idx, drug_name in enumerate([drug_a, drug_b]):
+            ax = axes[row_idx, col_idx]
+            info = mol_map[drug_name]
+            mol = info["mol"]
+            bi = info["bitInfo"]
 
-    # Hide empty axes
-    for idx in range(n_bits, n_rows * n_cols):
-        row = idx // n_cols
-        col = idx % n_cols
-        axes[row, col].axis("off")
+            highlight_atoms, radius = _get_bit_highlight_atoms(mol, bi, bit_id)
+
+            try:
+                img_arr = _mol_to_np_image(mol, size=400,
+                                           highlight_atoms=highlight_atoms)
+                ax.imshow(img_arr)
+                ax.set_title(
+                    f"{drug_name[:30]}",
+                    fontsize=9, fontweight="bold",
+                )
+            except Exception as e:
+                logger.warning(f"  MolToImage failed for {drug_name} bit {bit_id}: {e}")
+                ax.text(0.5, 0.5, f"{drug_name}\n(render failed)",
+                        ha="center", va="center", transform=ax.transAxes)
+
+            ax.axis("off")
+
+        # Row label on the left side
+        axes[row_idx, 0].text(
+            -0.05, 0.5,
+            f"Bit {bit_id} (r={radius})\n"
+            f"Shared by {len(drugs)}/{len(pw_drugs)} drugs",
+            transform=axes[row_idx, 0].transAxes,
+            fontsize=9, fontweight="bold", rotation=90,
+            va="center", ha="right",
+        )
 
     plt.suptitle(
-        f"Shared ECFP-4 Substructures: {best_pw}\n"
-        f"Highlighted atoms show the molecular fragment activating each shared bit",
+        f"Shared ECFP-4 Bits Across Drugs: {best_pw}\n"
+        f"Each row shows one fingerprint bit highlighted on two different drugs",
         fontsize=12, fontweight="bold", y=1.02,
     )
     plt.tight_layout()
