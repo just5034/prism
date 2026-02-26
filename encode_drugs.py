@@ -1021,6 +1021,52 @@ def plot_tanimoto_distributions(
 # FIGURE 6: Similarity Map Drug Pairs
 # =============================================================================
 
+def _mol_to_np_image(mol, size: int = 400, highlight_atoms: list = None):
+    """Render an RDKit mol to a numpy RGB array (headless-safe).
+
+    Parameters
+    ----------
+    mol : rdkit.Chem.Mol
+        Molecule to render.
+    size : int
+        Image width/height in pixels.
+    highlight_atoms : list or None
+        Atom indices to highlight in green.
+
+    Returns
+    -------
+    np.ndarray
+        RGB image array of shape (size, size, 3).
+    """
+    from rdkit.Chem import AllChem, Draw
+
+    AllChem.Compute2DCoords(mol)
+    img = Draw.MolToImage(
+        mol, size=(size, size),
+        highlightAtoms=highlight_atoms or [],
+    )
+    return np.array(img)
+
+
+def _get_shared_bit_atoms(mol_a, mol_b, bi_a: dict, bi_b: dict):
+    """Find atoms involved in fingerprint bits shared between two molecules.
+
+    Returns
+    -------
+    tuple of (list, list)
+        Highlight atom indices for mol_a and mol_b.
+    """
+    shared_bits = set(bi_a.keys()) & set(bi_b.keys())
+    atoms_a = set()
+    atoms_b = set()
+    for bit in shared_bits:
+        for center, rad in bi_a[bit]:
+            atoms_a.add(center)
+        for center, rad in bi_b[bit]:
+            atoms_b.add(center)
+    return sorted(atoms_a), sorted(atoms_b)
+
+
 def plot_similarity_map_pairs(
     df_smiles: pd.DataFrame,
     arr_ecfp: np.ndarray,
@@ -1028,10 +1074,11 @@ def plot_similarity_map_pairs(
     df_index: pd.DataFrame,
     fig_dir: Path,
 ) -> None:
-    """Plot atom-level similarity maps for a high-sim and low-sim drug pair.
+    """Plot drug pair comparisons: high-similarity vs low-similarity.
 
-    Shows WHERE in the molecular structure the similarity/dissimilarity
-    comes from, using RDKit SimilarityMaps.
+    Renders molecule structures side by side with shared-bit atoms
+    highlighted in green, demonstrating that same-pathway drugs share
+    molecular substructures while different-pathway drugs do not.
 
     Parameters
     ----------
@@ -1050,32 +1097,31 @@ def plot_similarity_map_pairs(
 
     try:
         from rdkit import Chem
-        from rdkit.Chem import AllChem, Draw
-        from rdkit.Chem.Draw import SimilarityMaps
+        from rdkit.Chem import AllChem
     except ImportError:
-        logger.warning("  RDKit Draw/SimilarityMaps not available, skipping")
+        logger.warning("  RDKit not available, skipping similarity map pairs")
         return
 
     _set_style()
 
     logger.info("  Generating similarity map drug pairs...")
 
+    mol_map = _build_mol_map(df_smiles, ecfp_names)
     sim = compute_tanimoto_matrix(arr_ecfp)
     name_to_pw = dict(zip(df_index["drug_name"], df_index["pathway"]))
-    smiles_map = dict(zip(df_smiles["drug_name"].str.strip(), df_smiles["smiles"]))
 
-    # Find best same-pathway pair (high sim, exclude diagonal)
+    # Find best same-pathway pair (high sim) and best diff-pathway pair (low sim)
     best_same = (-1, -1, 0.0)
-    best_diff = (-1, -1, 1.0)  # we want lowest for diff
+    best_diff = (-1, -1, 1.0)
     n = len(ecfp_names)
 
     for i in range(n):
         pw_i = name_to_pw.get(ecfp_names[i], "")
-        if not pw_i:
+        if not pw_i or ecfp_names[i] not in mol_map:
             continue
         for j in range(i + 1, n):
             pw_j = name_to_pw.get(ecfp_names[j], "")
-            if not pw_j:
+            if not pw_j or ecfp_names[j] not in mol_map:
                 continue
             val = float(sim[i, j])
             if pw_i == pw_j and val > best_same[2] and val < 0.99:
@@ -1092,61 +1138,62 @@ def plot_similarity_map_pairs(
         pairs.append((ecfp_names[i], ecfp_names[j], s, "Different pathway"))
 
     if not pairs:
-        logger.warning("  Could not find suitable drug pairs, skipping similarity maps")
+        logger.warning("  Could not find suitable drug pairs, skipping")
         return
 
-    # Fingerprint function for SimilarityMaps
-    def _get_fp(mol, atomId=-1):
-        if atomId >= 0:
-            info = {}
-            fp = AllChem.GetMorganFingerprint(
-                mol, ECFP_RADIUS, bitInfo=info, fromAtoms=[atomId]
-            )
-        else:
-            fp = AllChem.GetMorganFingerprint(mol, ECFP_RADIUS)
-        return fp
-
-    fig, axes = plt.subplots(len(pairs), 2, figsize=(14, 6 * len(pairs)))
+    fig, axes = plt.subplots(len(pairs), 2, figsize=(12, 5.5 * len(pairs)))
     if len(pairs) == 1:
         axes = axes.reshape(1, 2)
 
     for row, (name_a, name_b, tani, label) in enumerate(pairs):
-        smi_a = smiles_map.get(name_a, "")
-        smi_b = smiles_map.get(name_b, "")
-        mol_a = Chem.MolFromSmiles(smi_a)
-        mol_b = Chem.MolFromSmiles(smi_b)
-
-        if mol_a is None or mol_b is None:
+        info_a = mol_map.get(name_a)
+        info_b = mol_map.get(name_b)
+        if not info_a or not info_b:
             continue
+
+        # Find atoms involved in shared fingerprint bits
+        hl_a, hl_b = _get_shared_bit_atoms(
+            info_a["mol"], info_b["mol"],
+            info_a["bitInfo"], info_b["bitInfo"],
+        )
 
         pw_a = name_to_pw.get(name_a, "?")
         pw_b = name_to_pw.get(name_b, "?")
 
-        for col, (mol, name, pw) in enumerate(
-            [(mol_a, name_a, pw_a), (mol_b, name_b, pw_b)]
-        ):
+        n_shared = len(set(info_a["bitInfo"].keys()) & set(info_b["bitInfo"].keys()))
+        n_total_a = len(info_a["bitInfo"])
+        n_total_b = len(info_b["bitInfo"])
+
+        for col, (info, name, pw, hl) in enumerate([
+            (info_a, name_a, pw_a, hl_a),
+            (info_b, name_b, pw_b, hl_b),
+        ]):
             ax = axes[row, col]
-            ref_mol = mol_b if col == 0 else mol_a
             try:
-                _, maxw = SimilarityMaps.GetSimilarityMapForFingerprint(
-                    ref_mol, mol, _get_fp, ax=ax, colorMap="RdBu_r",
-                )
+                img_arr = _mol_to_np_image(info["mol"], size=500,
+                                           highlight_atoms=hl)
+                ax.imshow(img_arr)
             except Exception as e:
-                logger.debug(f"  SimilarityMap failed for {name}: {e}")
+                logger.warning(f"  MolToImage failed for {name}: {e}")
                 ax.text(0.5, 0.5, f"{name}\n(rendering failed)",
                         ha="center", va="center", transform=ax.transAxes)
                 continue
-            ax.set_title(f"{name}\n({pw})", fontsize=10, fontweight="bold")
 
-        # Row label
-        axes[row, 0].set_ylabel(
-            f"{label}\nTanimoto = {tani:.3f}",
-            fontsize=11, fontweight="bold", rotation=0, labelpad=100,
-            va="center",
+            ax.set_title(f"{name}\n({pw})", fontsize=11, fontweight="bold")
+            ax.axis("off")
+
+        # Annotate the row
+        axes[row, 0].text(
+            -0.02, 0.5,
+            f"{label}\nTanimoto = {tani:.3f}\n{n_shared} shared bits",
+            transform=axes[row, 0].transAxes,
+            fontsize=11, fontweight="bold", rotation=90,
+            va="center", ha="right",
         )
 
     plt.suptitle(
-        "Atom-Level Similarity Maps (ECFP-4)\nGreen = increases similarity, Pink = decreases",
+        "Drug Pair Comparison (ECFP-4)\n"
+        "Highlighted atoms participate in shared fingerprint bits",
         fontsize=13, fontweight="bold", y=1.02,
     )
     plt.tight_layout()
@@ -1187,10 +1234,8 @@ def plot_shared_bits(
     try:
         from rdkit import Chem
         from rdkit.Chem import AllChem, Draw
-        from io import BytesIO
-        from PIL import Image
     except ImportError:
-        logger.warning("  RDKit Draw or PIL not available, skipping shared bits plot")
+        logger.warning("  RDKit Draw not available, skipping shared bits plot")
         return
 
     _set_style()
@@ -1233,14 +1278,14 @@ def plot_shared_bits(
         logger.warning("  No shared bits found, skipping")
         return
 
-    # Pick up to 8 shared bits
+    # Pick up to 8 shared bits, preferring bits shared across more drugs
     display_bits = shared_bits[:8]
 
     n_bits = len(display_bits)
     n_cols = min(4, n_bits)
     n_rows = (n_bits + n_cols - 1) // n_cols
 
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 4 * n_rows))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4.5 * n_cols, 5 * n_rows))
     if n_rows == 1 and n_cols == 1:
         axes = np.array([[axes]])
     elif n_rows == 1:
@@ -1253,23 +1298,39 @@ def plot_shared_bits(
         col = idx % n_cols
         ax = axes[row, col]
 
-        # Draw the bit on the first drug that has it
+        # Draw the molecule with the bit's atoms highlighted
         drug_name = drugs[0]
         info = mol_map[drug_name]
         mol = info["mol"]
         bi = info["bitInfo"]
 
+        # Get atoms for this bit: bitInfo[bit_id] = [(center_atom, radius), ...]
+        highlight_atoms = []
+        radius_info = ""
+        if bit_id in bi:
+            for center, rad in bi[bit_id]:
+                highlight_atoms.append(center)
+                # Also get neighbors within radius
+                env = Chem.FindAtomEnvironmentOfRadiusN(mol, rad, center)
+                for bond_idx in env:
+                    bond = mol.GetBondWithIdx(bond_idx)
+                    highlight_atoms.append(bond.GetBeginAtomIdx())
+                    highlight_atoms.append(bond.GetEndAtomIdx())
+                radius_info = f"radius={rad}"
+            highlight_atoms = sorted(set(highlight_atoms))
+
         try:
-            img = Draw.DrawMorganBit(mol, bit_id, bi, useSVG=False)
-            # img is a PIL Image
-            ax.imshow(img)
+            img_arr = _mol_to_np_image(mol, size=400,
+                                       highlight_atoms=highlight_atoms)
+            ax.imshow(img_arr)
             ax.set_title(
-                f"Bit {bit_id}\nShared by {len(drugs)}/{len(pw_drugs)} drugs\n"
-                f"e.g. {drug_name[:20]}",
+                f"Bit {bit_id} ({radius_info})\n"
+                f"Shared by {len(drugs)}/{len(pw_drugs)} drugs\n"
+                f"{drug_name[:25]}",
                 fontsize=8, fontweight="bold",
             )
         except Exception as e:
-            logger.debug(f"  DrawMorganBit failed for bit {bit_id}: {e}")
+            logger.warning(f"  MolToImage failed for bit {bit_id}: {e}")
             ax.text(0.5, 0.5, f"Bit {bit_id}\n(render failed)",
                     ha="center", va="center", transform=ax.transAxes)
 
@@ -1282,8 +1343,8 @@ def plot_shared_bits(
         axes[row, col].axis("off")
 
     plt.suptitle(
-        f"Shared ECFP-4 Substructures in {best_pw} Drugs\n"
-        f"Each panel shows the molecular fragment activating a shared fingerprint bit",
+        f"Shared ECFP-4 Substructures: {best_pw}\n"
+        f"Highlighted atoms show the molecular fragment activating each shared bit",
         fontsize=12, fontweight="bold", y=1.02,
     )
     plt.tight_layout()
