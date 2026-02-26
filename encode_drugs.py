@@ -1541,10 +1541,10 @@ def plot_umap_hdbscan(
     # --- HDBSCAN clustering ---
     logger.info("  Running HDBSCAN clustering...")
     clusterer = hdbscan.HDBSCAN(
-        min_cluster_size=5,
-        min_samples=3,
+        min_cluster_size=8,
+        min_samples=2,
         metric="precomputed",
-        cluster_selection_method="eom",
+        cluster_selection_method="leaf",
     )
     labels = clusterer.fit_predict(dist)
 
@@ -1588,14 +1588,16 @@ def plot_umap_hdbscan(
         if not mask.any():
             continue
         lbl = f"Cluster {cid} ({mask.sum()})" if cid >= 0 else f"Noise ({mask.sum()})"
+        is_noise = cid == -1
         ax1.scatter(
             coords[mask, 0], coords[mask, 1],
             c=[cluster_colors[cid]],
             label=lbl,
-            s=45 if cid >= 0 else 20,
-            alpha=0.8 if cid >= 0 else 0.4,
-            edgecolors="white", linewidth=0.3,
-            marker="o" if cid >= 0 else "x",
+            s=45 if not is_noise else 20,
+            alpha=0.8 if not is_noise else 0.4,
+            edgecolors="none" if is_noise else "white",
+            linewidth=0.0 if is_noise else 0.3,
+            marker="x" if is_noise else "o",
         )
 
     ax1.set_xlabel("UMAP 1", fontsize=12)
