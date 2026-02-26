@@ -894,8 +894,11 @@ def _build_mol_map(
     dict
         {drug_name: {"mol": Mol, "smiles": str, "bitInfo": dict, "fp": BitVect}}
     """
-    from rdkit import Chem
+    from rdkit import Chem, RDLogger
     from rdkit.Chem import AllChem
+
+    # Suppress noisy deprecation warnings from DrawMorganBit internals
+    RDLogger.DisableLog("rdApp.warning")
 
     smiles_map = dict(zip(df_smiles["drug_name"].str.strip(), df_smiles["smiles"]))
     mol_map = {}
@@ -913,6 +916,7 @@ def _build_mol_map(
         )
         mol_map[name] = {"mol": mol, "smiles": smi, "bitInfo": bi, "fp": fp}
 
+    RDLogger.EnableLog("rdApp.warning")
     return mol_map
 
 
@@ -1196,11 +1200,12 @@ def plot_shared_bits(
     mol_map = _build_mol_map(df_smiles, ecfp_names)
     name_to_pw = dict(zip(df_index["drug_name"], df_index["pathway"]))
 
-    # Find the largest pathway with >= 2 drugs in mol_map
+    # Find the largest real pathway with >= 2 drugs in mol_map
+    skip_labels = {"", "Other", "other", "Unknown", "unknown", "nan"}
     pw_counts = {}
     for name in ecfp_names:
         pw = name_to_pw.get(name, "")
-        if pw and name in mol_map:
+        if pw and pw not in skip_labels and name in mol_map:
             pw_counts.setdefault(pw, []).append(name)
 
     # Pick the pathway with most drugs
