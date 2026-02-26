@@ -11,7 +11,9 @@ data/**/*
 !data/**/README.md
 
 # Specifically exclude common bioinformatics file formats
+# (exception: available_drugs.csv is small and needed on Delta for encode_drugs.py)
 *.csv
+!data/processed/available_drugs.csv
 *.csv.gz
 *.tsv
 *.tsv.gz
