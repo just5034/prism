@@ -695,14 +695,26 @@ def fetch_smiles_for_drug(
     str or None
         Canonical SMILES string, or None if not found.
     """
+    def _extract_smiles(properties_dict):
+        """Extract SMILES from PubChem response, handling key name changes."""
+        # PubChem renamed keys: CanonicalSMILES -> ConnectivitySMILES,
+        # IsomericSMILES -> SMILES. Check all known variants.
+        for key in ("CanonicalSMILES", "ConnectivitySMILES", "IsomericSMILES", "SMILES"):
+            if key in properties_dict:
+                return properties_dict[key]
+        return None
+
     def _try_url(url, label):
         try:
             resp = session.get(url, timeout=PUBCHEM_TIMEOUT)
             if resp.status_code == 200:
                 data = resp.json()
-                smiles = data["PropertyTable"]["Properties"][0]["CanonicalSMILES"]
-                logger.debug(f"    {name}: found by {label}")
-                return smiles
+                props = data["PropertyTable"]["Properties"][0]
+                smiles = _extract_smiles(props)
+                if smiles:
+                    logger.debug(f"    {name}: found by {label}")
+                    return smiles
+                logger.debug(f"    {name}: {label} returned 200 but no SMILES key in {list(props.keys())}")
             elif resp.status_code == 404:
                 logger.debug(f"    {name}: not found by {label} (404)")
             else:
@@ -717,15 +729,18 @@ def fetch_smiles_for_drug(
             logger.debug(f"    {name}: error ({label}): {type(e).__name__}: {e}")
         return None
 
+    # PubChem property to request (IsomericSMILES returns as "SMILES" key)
+    prop = "CanonicalSMILES,IsomericSMILES"
+
     # Strategy 1: By CID
     if cid:
-        url = f"{PUBCHEM_BASE_URL}/compound/cid/{cid}/property/CanonicalSMILES/JSON"
+        url = f"{PUBCHEM_BASE_URL}/compound/cid/{cid}/property/{prop}/JSON"
         result = _try_url(url, f"CID {cid}")
         if result:
             return result
 
     # Strategy 2: Exact name
-    url = f"{PUBCHEM_BASE_URL}/compound/name/{requests.utils.quote(name)}/property/CanonicalSMILES/JSON"
+    url = f"{PUBCHEM_BASE_URL}/compound/name/{requests.utils.quote(name)}/property/{prop}/JSON"
     result = _try_url(url, "exact name")
     if result:
         return result
@@ -733,7 +748,7 @@ def fetch_smiles_for_drug(
     # Strategy 3: Cleaned name
     cleaned = clean_drug_name(name)
     if cleaned != name:
-        url = f"{PUBCHEM_BASE_URL}/compound/name/{requests.utils.quote(cleaned)}/property/CanonicalSMILES/JSON"
+        url = f"{PUBCHEM_BASE_URL}/compound/name/{requests.utils.quote(cleaned)}/property/{prop}/JSON"
         result = _try_url(url, f"cleaned name '{cleaned}'")
         if result:
             return result
@@ -783,12 +798,28 @@ def download_drug_smiles(
     # Connectivity check: try a known drug before querying all 500+
     logger.info("  Testing PubChem API connectivity...")
     try:
-        test_url = f"{PUBCHEM_BASE_URL}/compound/name/aspirin/property/CanonicalSMILES/JSON"
+        test_url = (
+            f"{PUBCHEM_BASE_URL}/compound/name/aspirin/"
+            f"property/CanonicalSMILES,IsomericSMILES/JSON"
+        )
         test_resp = requests.get(test_url, timeout=PUBCHEM_TIMEOUT)
         if test_resp.status_code == 200:
             test_data = test_resp.json()
-            test_smiles = test_data["PropertyTable"]["Properties"][0]["CanonicalSMILES"]
-            logger.info(f"  PubChem API reachable (aspirin -> {test_smiles})")
+            test_props = test_data["PropertyTable"]["Properties"][0]
+            # Accept any SMILES key variant (API renames keys across versions)
+            test_smiles = None
+            for k in ("CanonicalSMILES", "ConnectivitySMILES", "IsomericSMILES", "SMILES"):
+                if k in test_props:
+                    test_smiles = test_props[k]
+                    break
+            if test_smiles:
+                logger.info(f"  PubChem API reachable (aspirin -> {test_smiles})")
+            else:
+                logger.error(
+                    f"  PubChem returned 200 but no SMILES key found. "
+                    f"Keys: {list(test_props.keys())}"
+                )
+                return False
         else:
             logger.error(
                 f"  PubChem API returned HTTP {test_resp.status_code} for test query. "
@@ -805,8 +836,9 @@ def download_drug_smiles(
         logger.error("  Skipping SMILES download.")
         return False
 
-    # Filter to unresolved drugs (not in cache or explicitly None meaning "tried and failed")
-    unresolved = [d for d in drugs if d["name"] not in cache]
+    # Filter to unresolved drugs: re-query drugs that previously failed (None)
+    # so a fixed script can recover from earlier bugs
+    unresolved = [d for d in drugs if cache.get(d["name"]) is None]
     logger.info(
         f"  Drugs: {len(drugs)} total, {len(cache)} cached, "
         f"{len(unresolved)} to query"
