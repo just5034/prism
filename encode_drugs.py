@@ -9,7 +9,7 @@ Outputs:
   - ECFP-4 fingerprints (2048-bit Morgan fingerprints, radius=2)
   - One-hot drug encoding (375-dim baseline)
   - Drug index mapping with metadata
-  - 4 publication-quality figures
+  - 8 publication-quality figures
 
 Usage:
     python encode_drugs.py                          # run everything
@@ -873,6 +873,505 @@ def plot_pathway_coverage(
 
 
 # =============================================================================
+# HELPER: Build mol objects + bitInfo for visualization
+# =============================================================================
+
+def _build_mol_map(
+    df_smiles: pd.DataFrame,
+    ecfp_names: list,
+) -> dict:
+    """Parse SMILES into RDKit mol objects with fingerprint bitInfo.
+
+    Parameters
+    ----------
+    df_smiles : pd.DataFrame
+        Drug names and SMILES strings.
+    ecfp_names : list
+        Drug names that have valid fingerprints.
+
+    Returns
+    -------
+    dict
+        {drug_name: {"mol": Mol, "smiles": str, "bitInfo": dict, "fp": BitVect}}
+    """
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+
+    smiles_map = dict(zip(df_smiles["drug_name"].str.strip(), df_smiles["smiles"]))
+    mol_map = {}
+
+    for name in ecfp_names:
+        smi = smiles_map.get(name)
+        if not smi:
+            continue
+        mol = Chem.MolFromSmiles(smi)
+        if mol is None:
+            continue
+        bi = {}
+        fp = AllChem.GetMorganFingerprintAsBitVect(
+            mol, radius=ECFP_RADIUS, nBits=ECFP_NBITS, bitInfo=bi
+        )
+        mol_map[name] = {"mol": mol, "smiles": smi, "bitInfo": bi, "fp": fp}
+
+    return mol_map
+
+
+# =============================================================================
+# FIGURE 5: Same-Pathway vs Cross-Pathway Tanimoto Distributions
+# =============================================================================
+
+def plot_tanimoto_distributions(
+    arr_ecfp: np.ndarray,
+    ecfp_names: list,
+    df_index: pd.DataFrame,
+    fig_dir: Path,
+) -> None:
+    """Plot overlapping histograms of same-pathway vs cross-pathway Tanimoto.
+
+    Directly demonstrates that the ECFP encoding produces higher similarity
+    scores for drugs sharing a target pathway than for unrelated drugs.
+
+    Parameters
+    ----------
+    arr_ecfp : np.ndarray
+        ECFP fingerprints (N, 2048).
+    ecfp_names : list
+        Drug names for each row.
+    df_index : pd.DataFrame
+        Drug metadata with pathway info.
+    fig_dir : Path
+        Output directory for figures.
+    """
+    import matplotlib.pyplot as plt
+    from scipy import stats
+
+    _set_style()
+
+    logger.info("  Computing same-pathway vs cross-pathway Tanimoto distributions...")
+    sim = compute_tanimoto_matrix(arr_ecfp)
+
+    # Map names to pathways
+    name_to_pw = dict(zip(df_index["drug_name"], df_index["pathway"]))
+    pathways = [name_to_pw.get(n, "") for n in ecfp_names]
+
+    # Collect upper-triangle pairwise values
+    same_pw = []
+    diff_pw = []
+    n = len(ecfp_names)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if not pathways[i] or not pathways[j]:
+                continue
+            val = float(sim[i, j])
+            if pathways[i] == pathways[j]:
+                same_pw.append(val)
+            else:
+                diff_pw.append(val)
+
+    if not same_pw or not diff_pw:
+        logger.warning("  Insufficient pathway data for distribution plot, skipping")
+        return
+
+    same_pw = np.array(same_pw)
+    diff_pw = np.array(diff_pw)
+
+    # Mann-Whitney U test
+    u_stat, p_val = stats.mannwhitneyu(same_pw, diff_pw, alternative="greater")
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    bins = np.linspace(0, 1, 51)
+    ax.hist(diff_pw, bins=bins, alpha=0.6, color="#3498db", density=True,
+            label=f"Different pathway (n={len(diff_pw):,})", edgecolor="white")
+    ax.hist(same_pw, bins=bins, alpha=0.6, color="#e74c3c", density=True,
+            label=f"Same pathway (n={len(same_pw):,})", edgecolor="white")
+
+    # Median lines
+    ax.axvline(np.median(diff_pw), color="#2c3e50", linestyle="--", linewidth=1.5,
+               label=f"Median diff: {np.median(diff_pw):.3f}")
+    ax.axvline(np.median(same_pw), color="#c0392b", linestyle="--", linewidth=1.5,
+               label=f"Median same: {np.median(same_pw):.3f}")
+
+    # Annotate p-value
+    p_str = f"p < 1e-{int(-np.log10(p_val))}" if p_val < 0.001 else f"p = {p_val:.4f}"
+    ax.text(0.97, 0.95, f"Mann-Whitney U\n{p_str}",
+            transform=ax.transAxes, ha="right", va="top",
+            fontsize=11, bbox=dict(boxstyle="round,pad=0.3", facecolor="wheat", alpha=0.8))
+
+    ax.set_xlabel("Tanimoto Similarity (ECFP-4)", fontsize=12)
+    ax.set_ylabel("Density", fontsize=12)
+    ax.set_title(
+        "ECFP-4 Encodes Pathway Relationships:\nSame-Pathway Drugs Are More Similar",
+        fontsize=14, fontweight="bold",
+    )
+    ax.legend(fontsize=10, loc="upper center")
+
+    plt.tight_layout()
+    path = fig_dir / "tanimoto_same_vs_diff_pathway.png"
+    fig.savefig(path, dpi=FIGURE_DPI, bbox_inches="tight")
+    plt.close(fig)
+    logger.info(f"  Saved {path}")
+
+
+# =============================================================================
+# FIGURE 6: Similarity Map Drug Pairs
+# =============================================================================
+
+def plot_similarity_map_pairs(
+    df_smiles: pd.DataFrame,
+    arr_ecfp: np.ndarray,
+    ecfp_names: list,
+    df_index: pd.DataFrame,
+    fig_dir: Path,
+) -> None:
+    """Plot atom-level similarity maps for a high-sim and low-sim drug pair.
+
+    Shows WHERE in the molecular structure the similarity/dissimilarity
+    comes from, using RDKit SimilarityMaps.
+
+    Parameters
+    ----------
+    df_smiles : pd.DataFrame
+        Drug SMILES data.
+    arr_ecfp : np.ndarray
+        ECFP fingerprints (N, 2048).
+    ecfp_names : list
+        Drug names for each row.
+    df_index : pd.DataFrame
+        Drug metadata with pathway info.
+    fig_dir : Path
+        Output directory for figures.
+    """
+    import matplotlib.pyplot as plt
+
+    try:
+        from rdkit import Chem
+        from rdkit.Chem import AllChem, Draw
+        from rdkit.Chem.Draw import SimilarityMaps
+    except ImportError:
+        logger.warning("  RDKit Draw/SimilarityMaps not available, skipping")
+        return
+
+    _set_style()
+
+    logger.info("  Generating similarity map drug pairs...")
+
+    sim = compute_tanimoto_matrix(arr_ecfp)
+    name_to_pw = dict(zip(df_index["drug_name"], df_index["pathway"]))
+    smiles_map = dict(zip(df_smiles["drug_name"].str.strip(), df_smiles["smiles"]))
+
+    # Find best same-pathway pair (high sim, exclude diagonal)
+    best_same = (-1, -1, 0.0)
+    best_diff = (-1, -1, 1.0)  # we want lowest for diff
+    n = len(ecfp_names)
+
+    for i in range(n):
+        pw_i = name_to_pw.get(ecfp_names[i], "")
+        if not pw_i:
+            continue
+        for j in range(i + 1, n):
+            pw_j = name_to_pw.get(ecfp_names[j], "")
+            if not pw_j:
+                continue
+            val = float(sim[i, j])
+            if pw_i == pw_j and val > best_same[2] and val < 0.99:
+                best_same = (i, j, val)
+            if pw_i != pw_j and val < best_diff[2] and val > 0.01:
+                best_diff = (i, j, val)
+
+    pairs = []
+    if best_same[0] >= 0:
+        i, j, s = best_same
+        pairs.append((ecfp_names[i], ecfp_names[j], s, "Same pathway"))
+    if best_diff[0] >= 0:
+        i, j, s = best_diff
+        pairs.append((ecfp_names[i], ecfp_names[j], s, "Different pathway"))
+
+    if not pairs:
+        logger.warning("  Could not find suitable drug pairs, skipping similarity maps")
+        return
+
+    # Fingerprint function for SimilarityMaps
+    def _get_fp(mol, atomId=-1):
+        if atomId >= 0:
+            info = {}
+            fp = AllChem.GetMorganFingerprint(
+                mol, ECFP_RADIUS, bitInfo=info, fromAtoms=[atomId]
+            )
+        else:
+            fp = AllChem.GetMorganFingerprint(mol, ECFP_RADIUS)
+        return fp
+
+    fig, axes = plt.subplots(len(pairs), 2, figsize=(14, 6 * len(pairs)))
+    if len(pairs) == 1:
+        axes = axes.reshape(1, 2)
+
+    for row, (name_a, name_b, tani, label) in enumerate(pairs):
+        smi_a = smiles_map.get(name_a, "")
+        smi_b = smiles_map.get(name_b, "")
+        mol_a = Chem.MolFromSmiles(smi_a)
+        mol_b = Chem.MolFromSmiles(smi_b)
+
+        if mol_a is None or mol_b is None:
+            continue
+
+        pw_a = name_to_pw.get(name_a, "?")
+        pw_b = name_to_pw.get(name_b, "?")
+
+        for col, (mol, name, pw) in enumerate(
+            [(mol_a, name_a, pw_a), (mol_b, name_b, pw_b)]
+        ):
+            ax = axes[row, col]
+            ref_mol = mol_b if col == 0 else mol_a
+            try:
+                _, maxw = SimilarityMaps.GetSimilarityMapForFingerprint(
+                    ref_mol, mol, _get_fp, ax=ax, colorMap="RdBu_r",
+                )
+            except Exception as e:
+                logger.debug(f"  SimilarityMap failed for {name}: {e}")
+                ax.text(0.5, 0.5, f"{name}\n(rendering failed)",
+                        ha="center", va="center", transform=ax.transAxes)
+                continue
+            ax.set_title(f"{name}\n({pw})", fontsize=10, fontweight="bold")
+
+        # Row label
+        axes[row, 0].set_ylabel(
+            f"{label}\nTanimoto = {tani:.3f}",
+            fontsize=11, fontweight="bold", rotation=0, labelpad=100,
+            va="center",
+        )
+
+    plt.suptitle(
+        "Atom-Level Similarity Maps (ECFP-4)\nGreen = increases similarity, Pink = decreases",
+        fontsize=13, fontweight="bold", y=1.02,
+    )
+    plt.tight_layout()
+    path = fig_dir / "drug_similarity_maps.png"
+    fig.savefig(path, dpi=FIGURE_DPI, bbox_inches="tight")
+    plt.close(fig)
+    logger.info(f"  Saved {path}")
+
+
+# =============================================================================
+# FIGURE 7: Shared-Bit Substructure Examples (DrawMorganBit)
+# =============================================================================
+
+def plot_shared_bits(
+    df_smiles: pd.DataFrame,
+    ecfp_names: list,
+    df_index: pd.DataFrame,
+    fig_dir: Path,
+) -> None:
+    """Show molecular substructures for fingerprint bits shared by same-pathway drugs.
+
+    Demonstrates WHY similar drugs produce similar fingerprints by rendering
+    the specific chemical fragments that activate shared bits.
+
+    Parameters
+    ----------
+    df_smiles : pd.DataFrame
+        Drug SMILES data.
+    ecfp_names : list
+        Drug names for each row.
+    df_index : pd.DataFrame
+        Drug metadata with pathway info.
+    fig_dir : Path
+        Output directory for figures.
+    """
+    import matplotlib.pyplot as plt
+
+    try:
+        from rdkit import Chem
+        from rdkit.Chem import AllChem, Draw
+        from io import BytesIO
+        from PIL import Image
+    except ImportError:
+        logger.warning("  RDKit Draw or PIL not available, skipping shared bits plot")
+        return
+
+    _set_style()
+
+    logger.info("  Finding shared substructure bits for same-pathway drugs...")
+
+    mol_map = _build_mol_map(df_smiles, ecfp_names)
+    name_to_pw = dict(zip(df_index["drug_name"], df_index["pathway"]))
+
+    # Find the largest pathway with >= 2 drugs in mol_map
+    pw_counts = {}
+    for name in ecfp_names:
+        pw = name_to_pw.get(name, "")
+        if pw and name in mol_map:
+            pw_counts.setdefault(pw, []).append(name)
+
+    # Pick the pathway with most drugs
+    best_pw = max(pw_counts, key=lambda k: len(pw_counts[k]), default=None)
+    if best_pw is None or len(pw_counts[best_pw]) < 2:
+        logger.warning("  Insufficient pathway data for shared bits plot, skipping")
+        return
+
+    pw_drugs = pw_counts[best_pw][:6]  # up to 6 drugs from the pathway
+    logger.info(f"  Using pathway '{best_pw}' with {len(pw_drugs)} drugs")
+
+    # Find bits shared by >= 2 drugs in this pathway
+    bit_drug_map = {}  # bit_id -> list of drug names that have it
+    for name in pw_drugs:
+        info = mol_map[name]
+        for bit_id in info["bitInfo"]:
+            bit_drug_map.setdefault(bit_id, []).append(name)
+
+    # Sort by number of drugs sharing the bit (most shared first)
+    shared_bits = [(bid, drugs) for bid, drugs in bit_drug_map.items()
+                   if len(drugs) >= 2]
+    shared_bits.sort(key=lambda x: -len(x[1]))
+
+    if not shared_bits:
+        logger.warning("  No shared bits found, skipping")
+        return
+
+    # Pick up to 8 shared bits
+    display_bits = shared_bits[:8]
+
+    n_bits = len(display_bits)
+    n_cols = min(4, n_bits)
+    n_rows = (n_bits + n_cols - 1) // n_cols
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 4 * n_rows))
+    if n_rows == 1 and n_cols == 1:
+        axes = np.array([[axes]])
+    elif n_rows == 1:
+        axes = axes.reshape(1, -1)
+    elif n_cols == 1:
+        axes = axes.reshape(-1, 1)
+
+    for idx, (bit_id, drugs) in enumerate(display_bits):
+        row = idx // n_cols
+        col = idx % n_cols
+        ax = axes[row, col]
+
+        # Draw the bit on the first drug that has it
+        drug_name = drugs[0]
+        info = mol_map[drug_name]
+        mol = info["mol"]
+        bi = info["bitInfo"]
+
+        try:
+            img = Draw.DrawMorganBit(mol, bit_id, bi, useSVG=False)
+            # img is a PIL Image
+            ax.imshow(img)
+            ax.set_title(
+                f"Bit {bit_id}\nShared by {len(drugs)}/{len(pw_drugs)} drugs\n"
+                f"e.g. {drug_name[:20]}",
+                fontsize=8, fontweight="bold",
+            )
+        except Exception as e:
+            logger.debug(f"  DrawMorganBit failed for bit {bit_id}: {e}")
+            ax.text(0.5, 0.5, f"Bit {bit_id}\n(render failed)",
+                    ha="center", va="center", transform=ax.transAxes)
+
+        ax.axis("off")
+
+    # Hide empty axes
+    for idx in range(n_bits, n_rows * n_cols):
+        row = idx // n_cols
+        col = idx % n_cols
+        axes[row, col].axis("off")
+
+    plt.suptitle(
+        f"Shared ECFP-4 Substructures in {best_pw} Drugs\n"
+        f"Each panel shows the molecular fragment activating a shared fingerprint bit",
+        fontsize=12, fontweight="bold", y=1.02,
+    )
+    plt.tight_layout()
+    path = fig_dir / "drug_shared_bits.png"
+    fig.savefig(path, dpi=FIGURE_DPI, bbox_inches="tight")
+    plt.close(fig)
+    logger.info(f"  Saved {path}")
+
+
+# =============================================================================
+# FIGURE 8: Bit Frequency & Density Analysis
+# =============================================================================
+
+def plot_bit_statistics(
+    arr_ecfp: np.ndarray,
+    fig_dir: Path,
+) -> None:
+    """Plot fingerprint bit density and frequency statistics.
+
+    Shows the information content and sparsity of the ECFP encoding.
+
+    Parameters
+    ----------
+    arr_ecfp : np.ndarray
+        ECFP fingerprints (N, 2048).
+    fig_dir : Path
+        Output directory for figures.
+    """
+    import matplotlib.pyplot as plt
+
+    _set_style()
+
+    logger.info("  Computing bit statistics...")
+
+    bits_per_mol = arr_ecfp.sum(axis=1)
+    bit_freq = arr_ecfp.sum(axis=0)
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+    # --- Panel (a): Bits on per molecule ---
+    ax = axes[0]
+    ax.hist(bits_per_mol, bins=30, color="#2ecc71", edgecolor="white", alpha=0.85)
+    ax.axvline(np.mean(bits_per_mol), color="#c0392b", linestyle="--", linewidth=1.5,
+               label=f"Mean: {np.mean(bits_per_mol):.0f}")
+    ax.set_xlabel("Active Bits per Drug", fontsize=11)
+    ax.set_ylabel("Number of Drugs", fontsize=11)
+    ax.set_title("(a) Fingerprint Density", fontsize=12, fontweight="bold")
+    ax.legend(fontsize=10)
+    ax.text(0.95, 0.85,
+            f"Sparsity: {1 - np.mean(bits_per_mol)/ECFP_NBITS:.1%}\n"
+            f"of {ECFP_NBITS} bits",
+            transform=ax.transAxes, ha="right", fontsize=10,
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", alpha=0.8))
+
+    # --- Panel (b): Top 30 most frequent bits ---
+    ax = axes[1]
+    top_n = 30
+    sorted_idx = np.argsort(bit_freq)[::-1][:top_n]
+    ax.bar(range(top_n), bit_freq[sorted_idx], color="#3498db", edgecolor="white")
+    ax.set_xlabel("Bit Rank", fontsize=11)
+    ax.set_ylabel("Number of Drugs with Bit Active", fontsize=11)
+    ax.set_title(f"(b) Top {top_n} Most Frequent Bits", fontsize=12, fontweight="bold")
+    ax.set_xticks(range(0, top_n, 5))
+
+    # --- Panel (c): Bit frequency distribution ---
+    ax = axes[2]
+    # Exclude always-zero bits
+    nonzero_freq = bit_freq[bit_freq > 0]
+    ax.hist(nonzero_freq, bins=40, color="#9b59b6", edgecolor="white", alpha=0.85)
+    ax.set_xlabel("Number of Drugs Activating Bit", fontsize=11)
+    ax.set_ylabel("Number of Bits", fontsize=11)
+    ax.set_title("(c) Bit Frequency Distribution", fontsize=12, fontweight="bold")
+
+    n_zero = int((bit_freq == 0).sum())
+    n_nonzero = int((bit_freq > 0).sum())
+    ax.text(0.95, 0.85,
+            f"Active bits: {n_nonzero}/{ECFP_NBITS}\n"
+            f"Unused bits: {n_zero}",
+            transform=ax.transAxes, ha="right", fontsize=10,
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="lightyellow", alpha=0.8))
+
+    plt.suptitle(
+        "ECFP-4 Fingerprint Statistics (2048-bit Morgan, radius=2)",
+        fontsize=14, fontweight="bold", y=1.02,
+    )
+    plt.tight_layout()
+    path = fig_dir / "ecfp_bit_statistics.png"
+    fig.savefig(path, dpi=FIGURE_DPI, bbox_inches="tight")
+    plt.close(fig)
+    logger.info(f"  Saved {path}")
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
@@ -932,10 +1431,19 @@ def main() -> None:
         fig_dir = data_dir.parent / "figures"
         fig_dir.mkdir(parents=True, exist_ok=True)
 
+        # Original 4 figures
         plot_tsne(arr_ecfp, ecfp_names, df_index, fig_dir)
         plot_similarity_heatmap(arr_ecfp, ecfp_names, df_index, fig_dir)
         plot_dashboard(df_index, df_compounds, df_avail, df_sample_meta, fig_dir)
         plot_pathway_coverage(df_index, fig_dir)
+
+        # New figures: demonstrate encoding quality
+        plot_tanimoto_distributions(arr_ecfp, ecfp_names, df_index, fig_dir)
+        plot_similarity_map_pairs(
+            df_smiles, arr_ecfp, ecfp_names, df_index, fig_dir
+        )
+        plot_shared_bits(df_smiles, ecfp_names, df_index, fig_dir)
+        plot_bit_statistics(arr_ecfp, fig_dir)
 
     # ---- Summary ----
     logger.info("")
