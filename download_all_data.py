@@ -643,7 +643,7 @@ def parse_drug_name_variants(name: str) -> list:
 
 
 def get_drug_list_from_compounds(compounds_path: Path) -> list:
-    """Parse GDSC compounds CSV to extract drug names and PubChem CIDs.
+    """Parse GDSC compounds CSV to extract drug names, synonyms, and PubChem CIDs.
 
     Parameters
     ----------
@@ -653,7 +653,7 @@ def get_drug_list_from_compounds(compounds_path: Path) -> list:
     Returns
     -------
     list of dict
-        Each dict has 'name' and optionally 'pubchem_cid'.
+        Each dict has 'name', 'synonyms' (list of str), and optionally 'pubchem_cid'.
     """
     drugs = []
     try:
@@ -665,15 +665,17 @@ def get_drug_list_from_compounds(compounds_path: Path) -> list:
             # Detect column names (may vary between releases)
             name_col = None
             cid_col = None
+            syn_col = None
             for h in headers:
                 h_lower = h.lower().strip()
                 if "drug_name" in h_lower or h_lower == "name":
                     name_col = h
                 if "pubchem" in h_lower or "cid" in h_lower:
                     cid_col = h
+                if "synonym" in h_lower:
+                    syn_col = h
 
             if name_col is None:
-                # Fall back to first column
                 name_col = headers[0]
                 logger.warning(f"  Could not find drug name column, using '{name_col}'")
 
@@ -691,7 +693,23 @@ def get_drug_list_from_compounds(compounds_path: Path) -> list:
                     except (ValueError, TypeError):
                         pass
 
-                drugs.append({"name": name, "pubchem_cid": cid})
+                # Parse synonyms: comma-separated list
+                synonyms = []
+                if syn_col and row.get(syn_col, "").strip():
+                    for s in row[syn_col].split(","):
+                        s = s.strip()
+                        if s and s != name:
+                            synonyms.append(s)
+
+                # If the drug name itself contains commas (e.g., "Brivanib, BMS-540215"),
+                # split and treat each part as a synonym
+                if "," in name:
+                    parts = [p.strip() for p in name.split(",") if p.strip()]
+                    for p in parts:
+                        if p not in synonyms:
+                            synonyms.append(p)
+
+                drugs.append({"name": name, "pubchem_cid": cid, "synonyms": synonyms})
 
         logger.info(f"  Found {len(drugs)} unique drugs in compounds file")
         return drugs
@@ -702,11 +720,11 @@ def get_drug_list_from_compounds(compounds_path: Path) -> list:
 
 
 def fetch_smiles_for_drug(
-    name: str, cid: int, session: requests.Session
+    name: str, cid: int, session: requests.Session, synonyms: list = None
 ) -> str:
     """Fetch SMILES string for a drug from PubChem.
 
-    Tries by CID first, then exact name, then cleaned name.
+    Tries by CID first, then exact name, then name variants, then synonyms.
 
     Parameters
     ----------
@@ -716,6 +734,8 @@ def fetch_smiles_for_drug(
         PubChem CID if known.
     session : requests.Session
         Requests session for connection pooling.
+    synonyms : list of str, optional
+        Alternative names to try from GDSC SYNONYMS column.
 
     Returns
     -------
@@ -778,6 +798,23 @@ def fetch_smiles_for_drug(
         result = _try_url(url, label)
         if result:
             return result
+
+    # Strategy N: Try each synonym from the GDSC SYNONYMS column
+    if synonyms:
+        for syn in synonyms:
+            syn = syn.strip()
+            if not syn or syn == name:
+                continue
+            url = f"{PUBCHEM_BASE_URL}/compound/name/{requests.utils.quote(syn)}/property/{prop}/JSON"
+            result = _try_url(url, f"synonym '{syn}'")
+            if result:
+                return result
+            # Also try synonym variants (desalted, no hyphens)
+            for variant, label in parse_drug_name_variants(syn):
+                url = f"{PUBCHEM_BASE_URL}/compound/name/{requests.utils.quote(variant)}/property/{prop}/JSON"
+                result = _try_url(url, f"synonym variant '{variant}'")
+                if result:
+                    return result
 
     return None
 
@@ -880,7 +917,8 @@ def download_drug_smiles(
                 name = drug["name"]
                 cid = drug.get("pubchem_cid")
 
-                smiles = fetch_smiles_for_drug(name, cid, session)
+                synonyms = drug.get("synonyms", [])
+                smiles = fetch_smiles_for_drug(name, cid, session, synonyms)
                 cache[name] = smiles  # None if not found
 
                 if smiles:
