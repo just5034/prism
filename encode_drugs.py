@@ -9,7 +9,7 @@ Outputs:
   - ECFP-4 fingerprints (2048-bit Morgan fingerprints, radius=2)
   - One-hot drug encoding (375-dim baseline)
   - Drug index mapping with metadata
-  - 8 publication-quality figures
+  - 9 publication-quality figures
 
 Usage:
     python encode_drugs.py                          # run everything
@@ -1447,6 +1447,272 @@ def plot_bit_statistics(
 
 
 # =============================================================================
+# FIGURE 9: UMAP + HDBSCAN Clustering Analysis
+# =============================================================================
+
+# Broad pathway superclasses for cleaner annotation
+_PATHWAY_SUPERCLASS = {
+    "ERK MAPK signaling": "Kinase signaling",
+    "PI3K/MTOR signaling": "Kinase signaling",
+    "RTK signaling": "Kinase signaling",
+    "ABL signaling": "Kinase signaling",
+    "JNK and p38 signaling": "Kinase signaling",
+    "IGF1R signaling": "Kinase signaling",
+    "WNT signaling": "Developmental",
+    "Hedgehog signaling": "Developmental",
+    "DNA replication": "DNA damage / replication",
+    "Genome integrity": "DNA damage / replication",
+    "Mitosis": "Cell cycle / mitosis",
+    "Cell cycle": "Cell cycle / mitosis",
+    "Apoptosis regulation": "Apoptosis",
+    "Chromatin histone acetylation": "Epigenetic",
+    "Chromatin histone methylation": "Epigenetic",
+    "Chromatin other": "Epigenetic",
+    "Cytoskeleton": "Cytoskeleton",
+    "Metabolism": "Metabolism",
+    "Hormone-related": "Hormone-related",
+    "p53 pathway": "p53 / apoptosis",
+}
+
+
+def _superclass(pathway: str) -> str:
+    """Map a TARGET_PATHWAY to a broad superclass."""
+    return _PATHWAY_SUPERCLASS.get(pathway, "Other")
+
+
+def plot_umap_hdbscan(
+    arr_ecfp: np.ndarray,
+    ecfp_names: list[str],
+    df_index: pd.DataFrame,
+    fig_dir: Path,
+) -> None:
+    """UMAP embedding of Tanimoto distances with HDBSCAN clustering.
+
+    Produces:
+      - A 2-panel figure: (a) colored by HDBSCAN cluster, (b) colored by
+        pathway superclass for comparison
+      - A CSV table of cluster composition and pathway enrichment
+
+    Parameters
+    ----------
+    arr_ecfp : np.ndarray
+        ECFP fingerprints (N, 2048).
+    ecfp_names : list of str
+        Drug names for each row.
+    df_index : pd.DataFrame
+        Drug metadata with pathway info.
+    fig_dir : Path
+        Output directory for figures.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
+
+    try:
+        import umap
+    except ImportError:
+        logger.warning("  umap-learn not installed, skipping UMAP clustering plot")
+        logger.warning("  Install with: pip install umap-learn")
+        return
+
+    try:
+        import hdbscan
+    except ImportError:
+        logger.warning("  hdbscan not installed, skipping UMAP clustering plot")
+        logger.warning("  Install with: pip install hdbscan")
+        return
+
+    _set_style()
+
+    logger.info("  Computing Tanimoto distance matrix for UMAP...")
+    sim = compute_tanimoto_matrix(arr_ecfp)
+    dist = 1.0 - sim  # Tanimoto distance
+
+    # --- UMAP on precomputed distance ---
+    logger.info("  Running UMAP (metric=precomputed)...")
+    reducer = umap.UMAP(
+        metric="precomputed",
+        n_components=2,
+        n_neighbors=15,
+        min_dist=0.1,
+        random_state=RANDOM_STATE,
+    )
+    coords = reducer.fit_transform(dist)
+
+    # --- HDBSCAN clustering ---
+    logger.info("  Running HDBSCAN clustering...")
+    clusterer = hdbscan.HDBSCAN(
+        min_cluster_size=5,
+        min_samples=3,
+        metric="precomputed",
+        cluster_selection_method="eom",
+    )
+    labels = clusterer.fit_predict(dist)
+
+    n_clusters = len(set(labels) - {-1})
+    n_noise = (labels == -1).sum()
+    logger.info(f"  HDBSCAN found {n_clusters} clusters, {n_noise} noise points")
+
+    # --- Pathway superclass mapping ---
+    name_to_pw = dict(zip(df_index["drug_name"], df_index["pathway"]))
+    superclasses = [_superclass(name_to_pw.get(n, "")) for n in ecfp_names]
+    unique_super = sorted(set(superclasses))
+    if "Other" in unique_super:
+        unique_super.remove("Other")
+        unique_super.append("Other")
+
+    # Color palettes
+    cluster_ids = sorted(set(labels) - {-1})
+    n_ccolors = max(len(cluster_ids), 1)
+    cluster_cmap = plt.cm.tab20 if n_ccolors <= 20 else plt.cm.gist_ncar
+    cluster_colors = {
+        cid: cluster_cmap(i / max(n_ccolors, 1))
+        for i, cid in enumerate(cluster_ids)
+    }
+    cluster_colors[-1] = "#cccccc"  # noise = gray
+
+    n_scolors = len(unique_super)
+    super_cmap = plt.cm.Set2 if n_scolors <= 8 else plt.cm.tab20
+    super_colors = {}
+    for i, sc in enumerate(unique_super):
+        if sc == "Other":
+            super_colors[sc] = "#cccccc"
+        else:
+            super_colors[sc] = super_cmap(i / max(n_scolors, 1))
+
+    # --- Two-panel figure ---
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 8))
+
+    # Panel (a): HDBSCAN clusters
+    for cid in [-1] + cluster_ids:
+        mask = labels == cid
+        if not mask.any():
+            continue
+        lbl = f"Cluster {cid} ({mask.sum()})" if cid >= 0 else f"Noise ({mask.sum()})"
+        ax1.scatter(
+            coords[mask, 0], coords[mask, 1],
+            c=[cluster_colors[cid]],
+            label=lbl,
+            s=45 if cid >= 0 else 20,
+            alpha=0.8 if cid >= 0 else 0.4,
+            edgecolors="white", linewidth=0.3,
+            marker="o" if cid >= 0 else "x",
+        )
+
+    ax1.set_xlabel("UMAP 1", fontsize=12)
+    ax1.set_ylabel("UMAP 2", fontsize=12)
+    ax1.set_title("(a) HDBSCAN Chemical Clusters", fontsize=13, fontweight="bold")
+    ax1.legend(
+        bbox_to_anchor=(0.0, -0.15), loc="upper left",
+        fontsize=7, frameon=True, ncol=3,
+        title="Cluster ID", title_fontsize=8,
+    )
+
+    # Panel (b): Pathway superclass overlay
+    for sc in unique_super:
+        mask = np.array([s == sc for s in superclasses])
+        if not mask.any():
+            continue
+        ax2.scatter(
+            coords[mask, 0], coords[mask, 1],
+            c=[super_colors[sc]],
+            label=f"{sc} ({mask.sum()})",
+            s=45, alpha=0.75,
+            edgecolors="white", linewidth=0.3,
+        )
+
+    ax2.set_xlabel("UMAP 1", fontsize=12)
+    ax2.set_ylabel("UMAP 2", fontsize=12)
+    ax2.set_title("(b) Pathway Superclass Overlay", fontsize=13, fontweight="bold")
+    ax2.legend(
+        bbox_to_anchor=(0.0, -0.15), loc="upper left",
+        fontsize=8, frameon=True, ncol=2,
+        title="Pathway Superclass", title_fontsize=9,
+    )
+
+    plt.suptitle(
+        "Drug Chemical Space: UMAP on Tanimoto Distance + HDBSCAN Clustering\n"
+        "ECFP-4 fingerprints reveal natural chemical groupings that align with "
+        "target biology",
+        fontsize=13, fontweight="bold", y=1.04,
+    )
+    plt.tight_layout()
+    path = fig_dir / "drug_umap_hdbscan.png"
+    fig.savefig(path, dpi=FIGURE_DPI, bbox_inches="tight")
+    plt.close(fig)
+    logger.info(f"  Saved {path}")
+
+    # --- Cluster enrichment table ---
+    _save_cluster_enrichment(
+        labels, ecfp_names, name_to_pw, superclasses, fig_dir
+    )
+
+
+def _save_cluster_enrichment(
+    labels: np.ndarray,
+    ecfp_names: list[str],
+    name_to_pw: dict[str, str],
+    superclasses: list[str],
+    fig_dir: Path,
+) -> None:
+    """Save cluster composition and pathway enrichment to CSV.
+
+    For each cluster, reports the top pathways, superclasses, and member drugs.
+
+    Parameters
+    ----------
+    labels : np.ndarray
+        HDBSCAN cluster labels (-1 = noise).
+    ecfp_names : list of str
+        Drug names.
+    name_to_pw : dict
+        Drug name to pathway mapping.
+    superclasses : list of str
+        Superclass labels per drug.
+    fig_dir : Path
+        Output directory.
+    """
+    from collections import Counter
+
+    records = []
+    for cid in sorted(set(labels)):
+        mask = labels == cid
+        members = [ecfp_names[i] for i in range(len(ecfp_names)) if mask[i]]
+        pathways = [name_to_pw.get(n, "") for n in members]
+        supers = [superclasses[i] for i in range(len(superclasses)) if mask[i]]
+
+        pw_counts = Counter(p for p in pathways if p)
+        sc_counts = Counter(s for s in supers if s and s != "Other")
+
+        top_pw = pw_counts.most_common(3)
+        top_sc = sc_counts.most_common(2)
+
+        records.append({
+            "cluster": int(cid),
+            "n_drugs": len(members),
+            "top_pathway_1": f"{top_pw[0][0]} ({top_pw[0][1]})" if len(top_pw) > 0 else "",
+            "top_pathway_2": f"{top_pw[1][0]} ({top_pw[1][1]})" if len(top_pw) > 1 else "",
+            "top_pathway_3": f"{top_pw[2][0]} ({top_pw[2][1]})" if len(top_pw) > 2 else "",
+            "top_superclass": f"{top_sc[0][0]} ({top_sc[0][1]})" if len(top_sc) > 0 else "",
+            "drugs": "; ".join(sorted(members)[:10]) + ("..." if len(members) > 10 else ""),
+        })
+
+    df_enrich = pd.DataFrame(records)
+    path = fig_dir / "cluster_enrichment.csv"
+    df_enrich.to_csv(path, index=False)
+    logger.info(f"  Saved {path}")
+
+    # Print summary to log
+    logger.info("  Cluster enrichment summary:")
+    for _, row in df_enrich.iterrows():
+        cid = row["cluster"]
+        label = "Noise" if cid == -1 else f"Cluster {cid}"
+        logger.info(
+            f"    {label} ({row['n_drugs']} drugs): "
+            f"{row['top_superclass']} | {row['top_pathway_1']}"
+        )
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
@@ -1519,6 +1785,9 @@ def main() -> None:
         )
         plot_shared_bits(df_smiles, ecfp_names, df_index, fig_dir)
         plot_bit_statistics(arr_ecfp, fig_dir)
+
+        # UMAP + HDBSCAN clustering analysis
+        plot_umap_hdbscan(arr_ecfp, ecfp_names, df_index, fig_dir)
 
     # ---- Summary ----
     logger.info("")
