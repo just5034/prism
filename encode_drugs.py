@@ -1447,51 +1447,27 @@ def plot_bit_statistics(
 
 
 # =============================================================================
-# FIGURE 9: UMAP + HDBSCAN Clustering Analysis
+# FIGURE 9: Nearest-Neighbor Pathway Concordance
 # =============================================================================
 
-# Broad pathway superclasses for cleaner annotation
-_PATHWAY_SUPERCLASS = {
-    "ERK MAPK signaling": "Kinase signaling",
-    "PI3K/MTOR signaling": "Kinase signaling",
-    "RTK signaling": "Kinase signaling",
-    "ABL signaling": "Kinase signaling",
-    "JNK and p38 signaling": "Kinase signaling",
-    "IGF1R signaling": "Kinase signaling",
-    "WNT signaling": "Developmental",
-    "Hedgehog signaling": "Developmental",
-    "DNA replication": "DNA damage / replication",
-    "Genome integrity": "DNA damage / replication",
-    "Mitosis": "Cell cycle / mitosis",
-    "Cell cycle": "Cell cycle / mitosis",
-    "Apoptosis regulation": "Apoptosis",
-    "Chromatin histone acetylation": "Epigenetic",
-    "Chromatin histone methylation": "Epigenetic",
-    "Chromatin other": "Epigenetic",
-    "Cytoskeleton": "Cytoskeleton",
-    "Metabolism": "Metabolism",
-    "Hormone-related": "Hormone-related",
-    "p53 pathway": "p53 / apoptosis",
-}
-
-
-def _superclass(pathway: str) -> str:
-    """Map a TARGET_PATHWAY to a broad superclass."""
-    return _PATHWAY_SUPERCLASS.get(pathway, "Other")
-
-
-def plot_umap_hdbscan(
+def plot_neighbor_concordance(
     arr_ecfp: np.ndarray,
     ecfp_names: list[str],
     df_index: pd.DataFrame,
     fig_dir: Path,
 ) -> None:
-    """UMAP embedding of Tanimoto distances with HDBSCAN clustering.
+    """Validate ECFP encoding via nearest-neighbor pathway concordance.
 
-    Produces:
-      - A 2-panel figure: (a) colored by HDBSCAN cluster, (b) colored by
-        pathway superclass for comparison
-      - A CSV table of cluster composition and pathway enrichment
+    For each drug, checks whether its k-nearest Tanimoto neighbors share
+    the same target pathway at rates above random chance.  This is the
+    standard cheminformatics validation for molecular fingerprints
+    (Riniker & Landrum 2013; Landrum 2021).
+
+    Produces a 3-panel figure:
+      (a) Concordance vs k — observed vs random baseline
+      (b) Per-pathway concordance at k=5
+      (c) Cumulative concordance curve (fraction of drugs whose top-1
+          neighbor shares pathway)
 
     Parameters
     ----------
@@ -1505,214 +1481,210 @@ def plot_umap_hdbscan(
         Output directory for figures.
     """
     import matplotlib.pyplot as plt
-    from matplotlib.patches import Patch
-
-    try:
-        import umap
-    except ImportError:
-        logger.warning("  umap-learn not installed, skipping UMAP clustering plot")
-        logger.warning("  Install with: pip install umap-learn")
-        return
-
-    try:
-        import hdbscan
-    except ImportError:
-        logger.warning("  hdbscan not installed, skipping UMAP clustering plot")
-        logger.warning("  Install with: pip install hdbscan")
-        return
+    from scipy import stats
 
     _set_style()
 
-    logger.info("  Computing Tanimoto distance matrix for UMAP...")
+    logger.info("  Computing nearest-neighbor pathway concordance...")
+
     sim = compute_tanimoto_matrix(arr_ecfp)
-    dist = (1.0 - sim).astype(np.float64)  # HDBSCAN requires float64
-
-    # --- UMAP on precomputed distance ---
-    logger.info("  Running UMAP (metric=precomputed)...")
-    reducer = umap.UMAP(
-        metric="precomputed",
-        n_components=2,
-        n_neighbors=15,
-        min_dist=0.1,
-        random_state=RANDOM_STATE,
-    )
-    coords = reducer.fit_transform(dist)
-
-    # --- HDBSCAN clustering on UMAP 2D coordinates ---
-    # Clustering in UMAP space works much better than on the raw distance
-    # matrix because UMAP compresses the manifold and separates groups.
-    logger.info("  Running HDBSCAN clustering on UMAP embedding...")
-    clusterer = hdbscan.HDBSCAN(
-        min_cluster_size=6,
-        min_samples=3,
-        cluster_selection_method="eom",
-    )
-    labels = clusterer.fit_predict(coords)
-
-    n_clusters = len(set(labels) - {-1})
-    n_noise = (labels == -1).sum()
-    logger.info(f"  HDBSCAN found {n_clusters} clusters, {n_noise} noise points")
-
-    # --- Pathway superclass mapping ---
     name_to_pw = dict(zip(df_index["drug_name"], df_index["pathway"]))
-    superclasses = [_superclass(name_to_pw.get(n, "")) for n in ecfp_names]
-    unique_super = sorted(set(superclasses))
-    if "Other" in unique_super:
-        unique_super.remove("Other")
-        unique_super.append("Other")
+    pathways = np.array([name_to_pw.get(n, "") for n in ecfp_names])
 
-    # Color palettes
-    cluster_ids = sorted(set(labels) - {-1})
-    n_ccolors = max(len(cluster_ids), 1)
-    cluster_cmap = plt.cm.tab20 if n_ccolors <= 20 else plt.cm.gist_ncar
-    cluster_colors = {
-        cid: cluster_cmap(i / max(n_ccolors, 1))
-        for i, cid in enumerate(cluster_ids)
-    }
-    cluster_colors[-1] = "#cccccc"  # noise = gray
+    # Only evaluate drugs that have a non-empty pathway label
+    has_pw = np.array([bool(pw) for pw in pathways])
+    n_with_pw = has_pw.sum()
+    logger.info(f"  {n_with_pw}/{len(ecfp_names)} drugs have pathway labels")
 
-    n_scolors = len(unique_super)
-    super_cmap = plt.cm.Set2 if n_scolors <= 8 else plt.cm.tab20
-    super_colors = {}
-    for i, sc in enumerate(unique_super):
-        if sc == "Other":
-            super_colors[sc] = "#cccccc"
+    # For each drug, rank all other drugs by Tanimoto similarity (descending)
+    # Zero out diagonal so a drug isn't its own neighbor
+    sim_work = sim.copy()
+    np.fill_diagonal(sim_work, -1.0)
+
+    # Sorted neighbor indices (highest similarity first)
+    neighbor_idx = np.argsort(-sim_work, axis=1)
+
+    # --- Compute concordance at each k ---
+    k_values = list(range(1, 21))
+    observed_at_k = []
+    random_at_k = []
+
+    # Random baseline: probability of matching pathway by chance
+    pw_counts = Counter(pathways[has_pw])
+    n_labeled = sum(pw_counts.values())
+    p_random = sum((c / n_labeled) ** 2 for c in pw_counts.values())
+    logger.info(f"  Random pathway match probability: {p_random:.3f}")
+
+    for k in k_values:
+        matches = 0
+        total = 0
+        for i in range(len(ecfp_names)):
+            if not has_pw[i]:
+                continue
+            pw_i = pathways[i]
+            # Check k nearest neighbors
+            neighbors = neighbor_idx[i, :k]
+            for j in neighbors:
+                if has_pw[j]:
+                    total += 1
+                    if pathways[j] == pw_i:
+                        matches += 1
+        concordance = matches / total if total > 0 else 0
+        observed_at_k.append(concordance)
+        random_at_k.append(p_random)
+
+    # --- Per-pathway concordance at k=5 ---
+    k_eval = 5
+    pw_concordance = {}
+    pw_drug_counts = {}
+    for i in range(len(ecfp_names)):
+        if not has_pw[i]:
+            continue
+        pw_i = pathways[i]
+        neighbors = neighbor_idx[i, :k_eval]
+        n_match = sum(1 for j in neighbors if has_pw[j] and pathways[j] == pw_i)
+        n_valid = sum(1 for j in neighbors if has_pw[j])
+        if n_valid > 0:
+            pw_concordance.setdefault(pw_i, []).append(n_match / n_valid)
+            pw_drug_counts[pw_i] = pw_drug_counts.get(pw_i, 0) + 1
+
+    # Mean concordance per pathway (only pathways with >= 3 drugs)
+    pw_means = {}
+    for pw, vals in pw_concordance.items():
+        if len(vals) >= 3:
+            pw_means[pw] = np.mean(vals)
+
+    # Sort by concordance descending
+    pw_sorted = sorted(pw_means.items(), key=lambda x: -x[1])
+
+    # --- Top-1 neighbor similarity-concordance curve ---
+    top1_records = []
+    for i in range(len(ecfp_names)):
+        if not has_pw[i]:
+            continue
+        j = neighbor_idx[i, 0]
+        top1_sim = float(sim_work[i, j])
+        match = 1 if has_pw[j] and pathways[j] == pathways[i] else 0
+        top1_records.append((top1_sim, match))
+
+    top1_records.sort(key=lambda x: x[0])
+    top1_sims = np.array([r[0] for r in top1_records])
+    top1_matches = np.array([r[1] for r in top1_records])
+
+    # Binned concordance: for drugs whose top-1 sim falls in each bin,
+    # what fraction have a pathway match?
+    bin_edges = np.linspace(0, 1, 21)
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    bin_concordance = []
+    bin_counts = []
+    for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
+        mask = (top1_sims >= lo) & (top1_sims < hi)
+        if mask.sum() > 0:
+            bin_concordance.append(top1_matches[mask].mean())
+            bin_counts.append(mask.sum())
         else:
-            super_colors[sc] = super_cmap(i / max(n_scolors, 1))
+            bin_concordance.append(np.nan)
+            bin_counts.append(0)
 
-    # --- Two-panel figure ---
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 8))
+    # --- Three-panel figure ---
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 6))
 
-    # Panel (a): HDBSCAN clusters
-    for cid in [-1] + cluster_ids:
-        mask = labels == cid
-        if not mask.any():
-            continue
-        lbl = f"Cluster {cid} ({mask.sum()})" if cid >= 0 else f"Noise ({mask.sum()})"
-        is_noise = cid == -1
-        ax1.scatter(
-            coords[mask, 0], coords[mask, 1],
-            c=[cluster_colors[cid]],
-            label=lbl,
-            s=45 if not is_noise else 20,
-            alpha=0.8 if not is_noise else 0.4,
-            edgecolors="none" if is_noise else "white",
-            linewidth=0.0 if is_noise else 0.3,
-            marker="x" if is_noise else "o",
-        )
+    # Panel (a): Concordance vs k
+    ax1.plot(k_values, observed_at_k, "o-", color="#e74c3c", linewidth=2,
+             markersize=5, label="Observed", zorder=3)
+    ax1.axhline(p_random, color="#95a5a6", linestyle="--", linewidth=1.5,
+                label=f"Random baseline ({p_random:.3f})")
+    ax1.fill_between(k_values, p_random, observed_at_k, alpha=0.15,
+                     color="#e74c3c")
 
-    ax1.set_xlabel("UMAP 1", fontsize=12)
-    ax1.set_ylabel("UMAP 2", fontsize=12)
-    ax1.set_title("(a) HDBSCAN Chemical Clusters", fontsize=13, fontweight="bold")
-    ax1.legend(
-        bbox_to_anchor=(0.0, -0.15), loc="upper left",
-        fontsize=7, frameon=True, ncol=3,
-        title="Cluster ID", title_fontsize=8,
-    )
+    # Fold enrichment annotation
+    fold_k1 = observed_at_k[0] / p_random if p_random > 0 else 0
+    fold_k5 = observed_at_k[4] / p_random if p_random > 0 else 0
+    ax1.text(0.95, 0.95,
+             f"Fold enrichment:\n  k=1: {fold_k1:.1f}x\n  k=5: {fold_k5:.1f}x",
+             transform=ax1.transAxes, ha="right", va="top", fontsize=10,
+             bbox=dict(boxstyle="round,pad=0.3", facecolor="wheat", alpha=0.8))
 
-    # Panel (b): Pathway superclass overlay
-    for sc in unique_super:
-        mask = np.array([s == sc for s in superclasses])
-        if not mask.any():
-            continue
-        ax2.scatter(
-            coords[mask, 0], coords[mask, 1],
-            c=[super_colors[sc]],
-            label=f"{sc} ({mask.sum()})",
-            s=45, alpha=0.75,
-            edgecolors="white", linewidth=0.3,
-        )
+    ax1.set_xlabel("k (number of nearest neighbors)", fontsize=11)
+    ax1.set_ylabel("Pathway concordance (fraction matching)", fontsize=11)
+    ax1.set_title("(a) Nearest-Neighbor Concordance vs k",
+                  fontsize=12, fontweight="bold")
+    ax1.legend(fontsize=10, loc="center right")
+    ax1.set_xlim(0.5, 20.5)
+    ax1.set_ylim(0, min(max(observed_at_k) * 1.3, 1.0))
 
-    ax2.set_xlabel("UMAP 1", fontsize=12)
-    ax2.set_ylabel("UMAP 2", fontsize=12)
-    ax2.set_title("(b) Pathway Superclass Overlay", fontsize=13, fontweight="bold")
-    ax2.legend(
-        bbox_to_anchor=(0.0, -0.15), loc="upper left",
-        fontsize=8, frameon=True, ncol=2,
-        title="Pathway Superclass", title_fontsize=9,
-    )
+    # Panel (b): Per-pathway concordance at k=5
+    if pw_sorted:
+        pw_names = [p[0] for p in pw_sorted[:15]]
+        pw_vals = [p[1] for p in pw_sorted[:15]]
+        pw_counts_list = [pw_drug_counts.get(p, 0) for p in pw_names]
+        colors_b = ["#2ecc71" if v > p_random else "#e74c3c" for v in pw_vals]
+
+        y_pos = range(len(pw_names))
+        bars = ax2.barh(y_pos, pw_vals, color=colors_b, edgecolor="white",
+                        height=0.7, alpha=0.85)
+        ax2.axvline(p_random, color="#95a5a6", linestyle="--", linewidth=1.5,
+                    label=f"Random ({p_random:.3f})")
+
+        ax2.set_yticks(list(y_pos))
+        ax2.set_yticklabels([f"{n} (n={pw_drug_counts.get(n, 0)})"
+                             for n in pw_names], fontsize=8)
+        ax2.invert_yaxis()
+
+        # Annotate bars with values
+        for i, (v, c) in enumerate(zip(pw_vals, pw_counts_list)):
+            ax2.text(v + 0.01, i, f"{v:.2f}", va="center", fontsize=8)
+
+    ax2.set_xlabel(f"Mean concordance at k={k_eval}", fontsize=11)
+    ax2.set_title(f"(b) Per-Pathway Concordance (k={k_eval})",
+                  fontsize=12, fontweight="bold")
+    ax2.legend(fontsize=9)
+
+    # Panel (c): Concordance by similarity bin
+    valid_bins = ~np.isnan(bin_concordance)
+    bc_arr = np.array(bin_concordance)
+    cnt_arr = np.array(bin_counts)
+
+    ax3.bar(bin_centers[valid_bins], bc_arr[valid_bins],
+            width=0.045, color="#3498db", edgecolor="white", alpha=0.85)
+    ax3.axhline(p_random, color="#95a5a6", linestyle="--", linewidth=1.5,
+                label=f"Random ({p_random:.3f})")
+
+    # Add count labels on top of bars
+    for bc, bv, n in zip(bin_centers[valid_bins], bc_arr[valid_bins],
+                         cnt_arr[valid_bins]):
+        if n > 0:
+            ax3.text(bc, bv + 0.02, f"n={n}", ha="center", fontsize=7,
+                     rotation=45)
+
+    ax3.set_xlabel("Top-1 Neighbor Tanimoto Similarity", fontsize=11)
+    ax3.set_ylabel("Pathway Match Rate", fontsize=11)
+    ax3.set_title("(c) Higher Similarity = Higher Concordance",
+                  fontsize=12, fontweight="bold")
+    ax3.legend(fontsize=9)
+    ax3.set_xlim(0, 1)
+    ax3.set_ylim(0, min(max(bc_arr[valid_bins]) * 1.3 if valid_bins.any() else 1, 1.0))
 
     plt.suptitle(
-        "Drug Chemical Space: UMAP on Tanimoto Distance + HDBSCAN Clustering\n"
-        "ECFP-4 fingerprints reveal natural chemical groupings that align with "
-        "target biology",
-        fontsize=13, fontweight="bold", y=1.04,
+        "ECFP-4 Fingerprint Validation: Nearest-Neighbor Pathway Concordance\n"
+        "Drugs with similar fingerprints share target pathways at rates "
+        "far above chance",
+        fontsize=13, fontweight="bold", y=1.03,
     )
     plt.tight_layout()
-    path = fig_dir / "drug_umap_hdbscan.png"
+    path = fig_dir / "neighbor_concordance.png"
     fig.savefig(path, dpi=FIGURE_DPI, bbox_inches="tight")
     plt.close(fig)
     logger.info(f"  Saved {path}")
 
-    # --- Cluster enrichment table ---
-    _save_cluster_enrichment(
-        labels, ecfp_names, name_to_pw, superclasses, fig_dir
-    )
-
-
-def _save_cluster_enrichment(
-    labels: np.ndarray,
-    ecfp_names: list[str],
-    name_to_pw: dict[str, str],
-    superclasses: list[str],
-    fig_dir: Path,
-) -> None:
-    """Save cluster composition and pathway enrichment to CSV.
-
-    For each cluster, reports the top pathways, superclasses, and member drugs.
-
-    Parameters
-    ----------
-    labels : np.ndarray
-        HDBSCAN cluster labels (-1 = noise).
-    ecfp_names : list of str
-        Drug names.
-    name_to_pw : dict
-        Drug name to pathway mapping.
-    superclasses : list of str
-        Superclass labels per drug.
-    fig_dir : Path
-        Output directory.
-    """
-    from collections import Counter
-
-    records = []
-    for cid in sorted(set(labels)):
-        mask = labels == cid
-        members = [ecfp_names[i] for i in range(len(ecfp_names)) if mask[i]]
-        pathways = [name_to_pw.get(n, "") for n in members]
-        supers = [superclasses[i] for i in range(len(superclasses)) if mask[i]]
-
-        pw_counts = Counter(p for p in pathways if p)
-        sc_counts = Counter(s for s in supers if s and s != "Other")
-
-        top_pw = pw_counts.most_common(3)
-        top_sc = sc_counts.most_common(2)
-
-        records.append({
-            "cluster": int(cid),
-            "n_drugs": len(members),
-            "top_pathway_1": f"{top_pw[0][0]} ({top_pw[0][1]})" if len(top_pw) > 0 else "",
-            "top_pathway_2": f"{top_pw[1][0]} ({top_pw[1][1]})" if len(top_pw) > 1 else "",
-            "top_pathway_3": f"{top_pw[2][0]} ({top_pw[2][1]})" if len(top_pw) > 2 else "",
-            "top_superclass": f"{top_sc[0][0]} ({top_sc[0][1]})" if len(top_sc) > 0 else "",
-            "drugs": "; ".join(sorted(members)[:10]) + ("..." if len(members) > 10 else ""),
-        })
-
-    df_enrich = pd.DataFrame(records)
-    path = fig_dir / "cluster_enrichment.csv"
-    df_enrich.to_csv(path, index=False)
-    logger.info(f"  Saved {path}")
-
-    # Print summary to log
-    logger.info("  Cluster enrichment summary:")
-    for _, row in df_enrich.iterrows():
-        cid = row["cluster"]
-        label = "Noise" if cid == -1 else f"Cluster {cid}"
-        logger.info(
-            f"    {label} ({row['n_drugs']} drugs): "
-            f"{row['top_superclass']} | {row['top_pathway_1']}"
-        )
+    # Log summary statistics
+    logger.info(f"  Concordance at k=1: {observed_at_k[0]:.3f} "
+                f"({fold_k1:.1f}x above random)")
+    logger.info(f"  Concordance at k=5: {observed_at_k[4]:.3f} "
+                f"({fold_k5:.1f}x above random)")
+    if pw_sorted:
+        logger.info(f"  Top pathway: {pw_sorted[0][0]} "
+                    f"(concordance={pw_sorted[0][1]:.3f})")
 
 
 # =============================================================================
@@ -1789,8 +1761,8 @@ def main() -> None:
         plot_shared_bits(df_smiles, ecfp_names, df_index, fig_dir)
         plot_bit_statistics(arr_ecfp, fig_dir)
 
-        # UMAP + HDBSCAN clustering analysis
-        plot_umap_hdbscan(arr_ecfp, ecfp_names, df_index, fig_dir)
+        # Nearest-neighbor concordance analysis (primary validation)
+        plot_neighbor_concordance(arr_ecfp, ecfp_names, df_index, fig_dir)
 
     # ---- Summary ----
     logger.info("")
