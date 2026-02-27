@@ -3,7 +3,7 @@
 **Purpose**: Chronological record of every analytical, architectural, and methodological decision made during this project, for manuscript Methods/Supplementary drafting.
 
 **Started**: October 20, 2025
-**Last Updated**: February 26, 2026
+**Last Updated**: February 26, 2026 (Session 8, continued)
 
 ---
 
@@ -397,6 +397,30 @@ Each ablation with 3-5 random seeds.
 - Attention visualization reveals novel CpG-gene regulatory candidates
 - LoRA fine-tuning of scGPT beats frozen embeddings
 
+### D-046: ECFP-4 Drug Encoding Validated and Complete
+**Date**: Feb 26, 2026 (Session 8)
+**Decision**: ECFP-4 fingerprints (2048-bit, Morgan radius=2) confirmed as drug encoding for the GNN pipeline. 314/375 modeled drugs encoded. 61 drugs without SMILES use one-hot fallback.
+**Validation**: k=1 nearest-neighbor pathway concordance = 29.3% (4.0× above random chance of 7.3%). Monotonic similarity-concordance relationship confirmed. Mann-Whitney U p < 1e-16 for same- vs cross-pathway Tanimoto distributions. See `docs/Drug_Encoding_Report.md` for full results.
+**Implementation**: `encode_drugs.py` produces `embeddings/drug_ecfp.npy`, `embeddings/drug_onehot.npy`, `embeddings/drug_index.csv`, and 9 validation figures.
+
+### D-047: 2D Visualization (t-SNE/UMAP) Inappropriate for ECFP Validation
+**Date**: Feb 26, 2026 (Session 8)
+**Decision**: Replaced UMAP+HDBSCAN clustering figure with nearest-neighbor pathway concordance as primary validation. t-SNE retained as supplementary only.
+**Rationale**: ECFP-4 produces 2048-bit sparse binary vectors where most drug pairs are nearly equidistant (Tanimoto ~0.1). Projecting N equidistant points to 2D is mathematically impossible without massive distortion (Wagen 2023). UMAP preserved only ~60% of true nearest-neighbor relationships. Nearest-neighbor concordance operates in the full 2048-dim space and is the standard cheminformatics validation (Riniker & Landrum 2013).
+**Alternative considered**: UMAP+HDBSCAN was implemented and tested; found 82-86% noise regardless of parameter tuning. GTM (Generative Topographic Mapping) considered but not justified for this dataset size.
+
+### D-048: Gene Expression Embedding — scGPT (OUTSTANDING)
+**Date**: Feb 26, 2026 (Session 8) — planned, not yet implemented
+**Decision**: Use scGPT pan-cancer checkpoint (51M params, 512-dim) for gene expression embeddings. Frozen inference, no fine-tuning on 987 samples.
+**Status**: NOT YET STARTED. Requires: install scGPT on Delta, prepare CPM+log1p normalized input, run inference on 987 cell lines, save to `embeddings/scgpt_cell_embeddings.npy`.
+**Fallback**: Geneformer V2 CLcancer, CancerFoundation, or PCA baseline.
+
+### D-049: Methylation Embedding — CpGPT (OUTSTANDING)
+**Date**: Feb 26, 2026 (Session 8) — planned, not yet implemented
+**Decision**: Use CpGPT-100M (100M params, trained on 150K+ bulk array samples) for CpG methylation embeddings. Frozen inference.
+**Status**: NOT YET STARTED. Requires: install CpGPT on Delta, format 10K CpG beta values, run inference on 987 cell lines, save to `embeddings/cpgpt_cpg_embeddings.npy`.
+**Fallback**: MethylGPT (15M params, 256-dim) or PCA on top-N variable CpGs.
+
 ---
 
 ## Version History
@@ -404,3 +428,4 @@ Each ablation with 3-5 random seeds.
 | Date | Session | Entries Added |
 |------|---------|---------------|
 | 2026-02-26 | 8 | Initial creation, D-001 through D-045 covering all sessions 1-8 |
+| 2026-02-26 | 8 (cont.) | D-046 through D-049: drug encoding completion, 2D viz limitation, outstanding FM embeddings |

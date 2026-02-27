@@ -1,7 +1,7 @@
 # Development Plan: PRISM Drug Response Prediction
 
 **Created**: February 17, 2026
-**Last Updated**: February 17, 2026
+**Last Updated**: February 26, 2026
 **Engineer**: Solo (team provides science guidance)
 **Compute**: ~1000 A100 hours on NCSA Delta (NSF ACCESS)
 **Related**: `docs/Refined_Strategy_Feb2026.md` (literature review + field assessment)
@@ -182,11 +182,12 @@ wandb              # experiment tracking (offline mode on Delta)
 ```
 
 **Deliverables**:
-- [ ] Delta environment working with GPU access confirmed
-- [ ] scGPT imports and loads checkpoint successfully
-- [ ] CpGPT imports and loads checkpoint successfully
-- [ ] PyG imports and basic graph operations work
-- [ ] Can load `ml_with_gene_expr.csv.gz` on Delta
+- [x] Delta environment working with GPU access confirmed
+- [ ] scGPT imports and loads checkpoint successfully ← **OUTSTANDING**
+- [ ] CpGPT imports and loads checkpoint successfully ← **OUTSTANDING**
+- [ ] PyG imports and basic graph operations work ← **OUTSTANDING**
+- [x] Can load `ml_with_gene_expr.csv.gz` on Delta
+- [x] RDKit installed and working on Delta
 
 **Decision gate**: If CpGPT won't install cleanly, fall back to MethylGPT or PCA.
 
@@ -197,40 +198,52 @@ wandb              # experiment tracking (offline mode on Delta)
 **Where**: Delta (~5-15 A100 hours)
 **Goal**: Pre-compute all foundation model embeddings. Save to disk. Never run these models again.
 
+**Status**: PARTIALLY COMPLETE — drug encoding done, gene expression and methylation embeddings outstanding.
+
 **Tasks**:
 
 1. **Prepare input data**
    - Gene expression: CPM + log1p normalization of the 19K gene features
    - Map gene names to scGPT vocabulary (handle missing genes)
    - CpG methylation: format 10K CpG beta values for CpGPT input
-   - Drug SMILES: collect from GDSC metadata or PubChem for 375 drugs
+   - ~~Drug SMILES: collect from GDSC metadata or PubChem for 375 drugs~~ ✅ DONE (314/375 with SMILES)
 
-2. **Run scGPT inference**
+2. **Run scGPT inference** ← **OUTSTANDING**
    - Load pan-cancer checkpoint
    - Feed 987 cell line expression profiles
    - Extract 512-dim cell embeddings (and per-gene embeddings if available)
    - Save: `embeddings/scgpt_cell_embeddings.npy` (987 x 512)
    - Save: `embeddings/scgpt_gene_embeddings.npy` (987 x N_genes x 512) if feasible
 
-3. **Run CpGPT inference**
+3. **Run CpGPT inference** ← **OUTSTANDING**
    - Load CpGPT-100M
    - Feed 987 cell line methylation profiles
    - Extract per-sample embeddings (and per-CpG embeddings if available)
    - Save: `embeddings/cpgpt_sample_embeddings.npy`
    - Save: `embeddings/cpgpt_cpg_embeddings.npy` if feasible
 
-4. **Run alternative expression models (via Helical)**
+4. **Run alternative expression models (via Helical)** ← **OUTSTANDING**
    - Geneformer V2 CLcancer checkpoint
    - CancerFoundation (smaller, cancer-specific)
    - Save each to `embeddings/` for comparison in Phase 2
 
-5. **Extract drug features**
-   - ECFP-4 fingerprints (2048-bit) for all 375 drugs using RDKit
-   - One-hot drug encoding (375-dim) as baseline
-   - Save: `embeddings/drug_ecfp.npy`, `embeddings/drug_onehot.npy`
+5. ~~**Extract drug features**~~ ✅ DONE (Feb 26, 2026)
+   - ✅ ECFP-4 fingerprints (2048-bit) for 314/375 drugs using RDKit
+   - ✅ One-hot drug encoding (375-dim) as baseline
+   - ✅ Saved: `embeddings/drug_ecfp.npy` (314, 2048), `embeddings/drug_onehot.npy` (375, 375)
+   - ✅ Saved: `embeddings/drug_index.csv` with metadata mapping
+   - ✅ Validated: 9 figures including k-NN concordance (4.0× enrichment at k=1)
+   - ✅ Documented: `docs/Drug_Encoding_Report.md`
 
 **Deliverables**:
-- [ ] `embeddings/` directory with all pre-computed vectors
+- [x] `embeddings/drug_ecfp.npy` — ECFP-4 fingerprints (314, 2048)
+- [x] `embeddings/drug_onehot.npy` — one-hot baseline (375, 375)
+- [x] `embeddings/drug_index.csv` — drug name ↔ index mapping
+- [ ] `embeddings/scgpt_cell_embeddings.npy` — gene expression embeddings ← **OUTSTANDING**
+- [ ] `embeddings/scgpt_gene_embeddings.npy` — per-gene embeddings ← **OUTSTANDING**
+- [ ] `embeddings/cpgpt_sample_embeddings.npy` — methylation sample embeddings ← **OUTSTANDING**
+- [ ] `embeddings/cpgpt_cpg_embeddings.npy` — per-CpG embeddings ← **OUTSTANDING**
+- [ ] Alternative FM embeddings (Geneformer, CancerFoundation) ← **OUTSTANDING**
 - [ ] Validation: embedding shapes, no NaNs, reasonable value ranges
 - [ ] Total storage: ~50-200 MB (trivially small)
 
